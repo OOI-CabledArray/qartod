@@ -14,7 +14,7 @@ from scipy.stats import normaltest
 import dask
 from dask.diagnostics import ProgressBar
 
-from ooi_data_explorations.qartod.climatology import Climatology
+from climatology import Climatology
 
 # csv file ordered header row
 ANNO_HEADER = ['id', 'subsite', 'node', 'sensor', 'stream', 'method', 'parameters',
