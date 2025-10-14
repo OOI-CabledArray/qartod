@@ -44,4 +44,10 @@ CE04OSBP-LJ01C-10-PHSEND107,fixed,CE04OSBP-LJ01C-10-PHSEND107-streamed-phsen_dat
 CE04OSPS-SF01B-3C-PARADA102,profiler,CE04OSPS-SF01B-3C-PARADA102-streamed-parad_sa_sample,"['par_counts_output']"
 RS01SBPS-SF01A-3C-PARADA101,profiler,RS01SBPS-SF01A-3C-PARADA101-streamed-parad_sa_sample,"['par_counts_output']"
 RS03AXPS-SF03A-3C-PARADA301,profiler,RS03AXPS-SF03A-3C-PARADA301-streamed-parad_sa_sample,"['par_counts_output']"
-
+RS03INT1-MJ03C-07-D1000A301,fixed,RS03INT1-MJ03C-07-D1000A301-streamed-d1000_sample,"['temperature1','temperature2','temperature3']"
+RS01SLBS-MJ01A-06-PRESTA101,fixed,RS01SLBS-MJ01A-06-PRESTA101-streamed-prest_real_time,"['seafloor_pressure','pressure_temp']"
+RS03AXBS-MJ03A-06-PRESTA301,fixed,RS03AXBS-MJ03A-06-PRESTA301-streamed-prest_real_time,"['seafloor_pressure','pressure_temp']"
+RS01SUM1-LJ01B-09-PRESTB102,fixed,RS01SUM1-LJ01B-09-PRESTB102-streamed-prest_real_time,"['seafloor_pressure','pressure_temp']"
+RS03ASHS-MJ03B-07-TMPSFA301,fixed,RS03ASHS-MJ03B-07-TMPSFA301-streamed-tmpsf_sample,"['temperature01','temperature02','temperature03','temperature04','temperature05','temperature06','temperature07','temperature08','temperature09','temperature10','temperature11','temperature12','temperature13','temperature14','temperature15','temperature16','temperature17','temperature18','temperature19','temperature20','temperature21','temperature22','temperature23','temperature24']"
+RS03INT1-MJ03C-10-TRHPHA301,fixed,RS03INT1-MJ03C-10-TRHPHA301-streamed-trhph_sample,"['resistivity_5','resistivity_x1','resistivity_x5','vent_fluid_temperature']"
+RS03INT1-MJ03C-09-TRHPHA302,fixed,RS03INT1-MJ03C-09-TRHPHA302-streamed-trhph_sample,"['resistivity_5','resistivity_x1','resistivity_x5','vent_fluid_temperature']"
