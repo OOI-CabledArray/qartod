@@ -73,7 +73,8 @@ def add_annotation_qc_flags(ds, annotations, pidDict):
         if np.isnan(pid):
             param_name = "rollup"
         else:
-            paramName = pidDict['PD'+str(pid)]['netcdf_name']
+            print(pidDict['PD'+str(pid)])
+            param_name = pidDict['PD'+str(pid)]['netcdf_name']
         stream_annos.update({param_name: pid})
 
     # Next, get the flags associated with each parameter or all parameters
