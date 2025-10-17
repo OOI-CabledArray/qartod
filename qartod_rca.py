@@ -391,6 +391,7 @@ def main(argv=None):
     qartodTests_dict = {}
     for qcVar in dataVars:
         qartodTests_dict[qcVar] = {}
+        print(qcVar)
         qcParam = [i for i in param_dict if qcVar in param_dict[i]['variables']][0]
         qartodTests_dict[qcVar]['tests'] = {t for t in qartod_tests if qcParam in qartod_tests[t]['parameters']}
         qartodTests_dict[qcVar]['limits'] = param_dict[qcParam]['limits']
