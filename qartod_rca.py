@@ -278,6 +278,13 @@ def filterData(data, node, site, sensor, param, cut_off, annotations, pidDict):
 
     return data
 
+def get_s3_kwargs():
+    aws_key = os.environ.get("AWS_KEY")
+    aws_secret = os.environ.get("AWS_SECRET")
+
+    s3_kwargs = {'key': aws_key, 'secret': aws_secret}
+    return s3_kwargs
+
 
 def inputs(argv=None):
     if argv is None:
@@ -317,7 +324,7 @@ def loadAnnotations(site):
 
 
 def loadData(zarrDir):
-    fs = s3fs.S3FileSystem(anon=True)
+    fs = s3fs.S3FileSystem(**get_s3_kwargs())
     zarr_store = fs.get_mapper('ooi-data/' + zarrDir)
     ds = xr.open_zarr(zarr_store, consolidated=True)
 
