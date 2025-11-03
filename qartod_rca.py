@@ -309,7 +309,7 @@ def inputs(argv=None):
 def loadAnnotations(site):
     print(site)
     anno = {}
-    fs = s3fs.S3FileSystem(anon=True)
+    fs = s3fs.S3FileSystem(**get_s3_kwargs())
     INPUT_BUCKET = 'ooi-data/'
     annoFile = INPUT_BUCKET + 'annotations/' + site + '.json'
     if fs.exists(annoFile):
