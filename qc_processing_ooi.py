@@ -13,6 +13,7 @@ import sys
 from scipy.stats import normaltest
 import dask
 from dask.diagnostics import ProgressBar
+from loguru import logger
 
 from climatology import Climatology
 
@@ -417,6 +418,7 @@ def format_gross_range(parameter, sensor_range, user_range, site, node, sensor, 
         'source': '',
         'notes': notes
     }
+    logger.info(f"qc_dict: {qc_dict}")
     return qc_dict
 
 
@@ -457,6 +459,7 @@ def process_gross_range(ds, parameters, sensor_range, **kwargs):
     sensor_range = np.atleast_2d(sensor_range).tolist()
     for idx, param in enumerate(parameters):
         if param in ds.variables:
+            logger.info(f"Filtering data prior to testing normality of {param}")
             # roughly estimate if the data is normally distributed using a bootstrap analysis to randomly select
             # 4500 data points to use, running the test a total of 5000 times
 
@@ -464,8 +467,17 @@ def process_gross_range(ds, parameters, sensor_range, **kwargs):
             random_choice = dask.delayed(np.random.choice)
 
             # Select out the dataarray of the desired param. This speeds up the process
-            m = (ds[param] > sensor_range[idx][0]) & (ds[param] < sensor_range[idx][1]) & (~np.isnan(ds[param]))
-            da = ds[param][m]
+            # m = (ds[param] > sensor_range[idx][0]) & (ds[param] < sensor_range[idx][1]) & (~np.isnan(ds[param]))
+            # da = ds[param][m]
+
+            # TODO we might need to decide on a way to subset the dataset first... 
+            da = ds[param].where(
+                (ds[param] > sensor_range[idx][0]) &
+                (ds[param] < sensor_range[idx][1]) &
+                (~np.isnan(ds[param])),
+                #drop=True
+                )
+            
             vals = []
             for i in range(5000):
                 vals.append(random_choice(da, 4500))
@@ -477,6 +489,7 @@ def process_gross_range(ds, parameters, sensor_range, **kwargs):
 
             pnorm = [normaltest(v).pvalue for v in pvals]
             if np.mean(pnorm) < 0.05:
+                logger.info(f"{param} data is not normally distributed")
                 # Even with a log-normal transformation, the data is not normally distributed, so we will
                 # set the user range using percentiles that approximate the Empirical Rule, covering
                 # 99.7% of the data
@@ -486,6 +499,7 @@ def process_gross_range(ds, parameters, sensor_range, **kwargs):
                          'Percentiles were chosen to cover 99.7% of the data, approximating the Empirical Rule.')
             else:
                 # most likely this data is normally distributed, or close enough, and we can use the Empirical Rule
+                logger.info(f"{param} data is normally distributed")
                 mu = da.mean().values
                 sd = da.std().values
                 lower = mu - sd * 3

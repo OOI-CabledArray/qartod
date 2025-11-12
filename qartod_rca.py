@@ -13,6 +13,7 @@ import pytz
 import s3fs
 import sys
 import xarray as xr
+from loguru import logger
 
 from qc_processing_ooi import process_gross_range, process_climatology
 import decimate
@@ -307,7 +308,7 @@ def inputs(argv=None):
 
 
 def loadAnnotations(site):
-    print(site)
+    logger.info(f"loading annotations for {site}")
     anno = {}
     fs = s3fs.S3FileSystem(**get_s3_kwargs())
     INPUT_BUCKET = 'ooi-data/'
@@ -345,12 +346,15 @@ def processData(data,param):
 
 def runQartod(test,data,param,limits,site,node,sensor,stream):
 
+    logger.info(f"running {test} for {param}")
+    logger.info(f"data: {data} ")
+
     if 'gross_range' in test:
-        qartodResults = process_gross_range(data.compute(), [param], limits, site=site,
+        qartodResults = process_gross_range(data, [param], limits, site=site,
                                         node=node, sensor=sensor, stream=stream)
 
     elif 'climatology' in test:
-        clm_lookup, clm_table = process_climatology(data.compute(), [param], limits, site=site,
+        clm_lookup, clm_table = process_climatology(data, [param], limits, site=site,
                                                     depth_bins = np.array([]), node=node,
                                                     sensor=sensor, stream=stream)
         qartodResults = [clm_lookup, clm_table]
