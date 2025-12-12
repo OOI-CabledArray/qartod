@@ -249,8 +249,8 @@ def _setup_profiler_bins(node: str) -> List[float]:
     """
     if 'SF0' in node:
         # Shallow profiler: fine resolution near surface
-        shallow_upper = np.arange(6, 8, 1)
-        shallow_lower = np.arange(10, 15, 5)
+        shallow_upper = np.arange(6, 105, 1)
+        shallow_lower = np.arange(105, 200, 5)
         return np.concatenate((shallow_upper, shallow_lower), axis=0).tolist()
     
     elif 'DP0' in node:
