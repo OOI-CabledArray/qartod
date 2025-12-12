@@ -1,487 +1,534 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import argparse
+"""
+QARTOD Driver for Regional Cabled Array
+
+Main orchestration script for running QARTOD tests on OOI data.
+Handles both fixed platforms and profiling platforms with depth binning.
+"""
+
 from ast import literal_eval
-from datetime import datetime, timezone
-import dateutil.parser as parser
-import json
 import numpy as np
-import os
 import pandas as pd
-import pytz
-import s3fs
-import sys
-import xarray as xr
 from loguru import logger
+import traceback
+from typing import Dict, List, Tuple, Optional, Any
 
-from qc_processing_ooi import process_gross_range, process_climatology
-import decimate
+import qartodProcessing as qp
+import grossRange as gr
+import climatology as ct
+import export as ex
+
+# Platform types
+PLATFORM_FIXED = 'fixed'
+PLATFORM_PROFILER = 'profiler'
+
+# Test types
+TEST_GROSS_RANGE = 'gross_range'
+TEST_CLIMATOLOGY = 'climatology'
+
+# Calculation types
+CALC_INTEGRATED = 'int'
+CALC_BINNED = 'binned'
 
 
-def add_annotation_qc_flags(ds, annotations, pidDict):
+def runQartod(test: str, data, param: str, limits: List[float], 
+              **kwargs) -> Optional[Dict]:
     """
-    Add the annotation qc flags to a dataset as a data variable. From the
-    annotations, add the QARTOD flags to the dataset for each relevant data
-    variable in the annotations.
-
-    :param ds: Xarray dataset object containing the OOI data for a given
-        reference designator-method-stream
-    :param annotations: Pandas dataframe object which contains the annotations
-        to add to the dataset
-
-    :return ds: The input xarray dataset with the annotation qc flags added as a
-        named variable to the dataset.
+    Run specified QARTOD test on provided dataset.
+    
+    Args:
+        test: Test name ('gross_range' or 'climatology')
+        data: xarray Dataset
+        param: Parameter name
+        limits: Sensor limits [min, max]
+        **kwargs: Additional context (site, node, sensor, stream, was_decimated, original_points, final_points)
+    
+    Returns:
+        Dictionary of test results, or None if test not supported
     """
-    # First, add a local function to convert times
-    def convert_time(ms):
-        if ms is None:
-            return None
-        else:
-            return datetime.utcfromtimestamp(ms/1000)
-
-    # First, check the type of the annotations to determine if needed to put into a dataframe
-    if type(annotations) is list or type(annotations) is dict:
-        annotations = pd.DataFrame(annotations)
-
-    # Convert the flags to QARTOD flags
-    codes = {
-        None: 0,
-        'pass': 1,
-        'not_evaluated': 2,
-        'suspect': 3,
-        'fail': 4,
-        'not_operational': 0,
-        'not_available': 0,
-        'pending_ingest': 0
-    }
-    annotations['qcFlag'] = annotations['qcFlag'].map(codes).astype('category')
-
-    # Filter only for annotations which apply to the dataset
-    stream = ds.attrs["stream"]
-    stream_mask = annotations["stream"].apply(lambda x: True if x == stream or x is None else False)
-    annotations = annotations[stream_mask]
-
-    # Explode the annotations so each parameter is hit for each
-    # annotation
-    annotations = annotations.explode(column="parameters")
-
-    ###
-    ### Lookup parameter name in parameter/pid dictionary
-    ###
-    stream_annos = {}
-    for pid in annotations["parameters"].unique():
-        if np.isnan(pid):
-            param_name = "rollup"
-        else:
-            print(pidDict['PD'+str(pid)])
-            param_name = pidDict['PD'+str(pid)]['netcdf_name']
-        stream_annos.update({param_name: pid})
-
-    # Next, get the flags associated with each parameter or all parameters
-    flags_dict = {}
-    for key in stream_annos.keys():
-        # Get the pid and associated name
-        pid_name = key
-        pid = pd.to_numeric(stream_annos.get(key), errors='coerce')
-
-        # Get the annotations associated with the pid
-        if np.isnan(pid):
-            pid_annos = annotations[annotations["parameters"].isna()]
-        else:
-            pid_annos = annotations[annotations["parameters"] == pid]
-
-        pid_annos = pid_annos.sort_values(by="qcFlag")
-
-        # Create an array of flags to begin setting the qc-values
-        pid_flags = pd.Series(np.zeros(ds.time.values.shape), index=ds.time.values)
-
-        # For each index, set the qcFlag for each respective time period
-        for ind in pid_annos.index:
-            beginDT = pid_annos["beginDT"].loc[ind]
-            endDT = pid_annos["endDT"].loc[ind]
-            qcFlag = pid_annos["qcFlag"].loc[ind]
-            # Convert the time to actual date times
-            beginDT = convert_time(beginDT)
-            if endDT is None or np.isnan(endDT):
-                endDT = datetime.now()
-            else:
-                endDT = convert_time(endDT)
-            # Set the qcFlags for the given time range
-            pid_flags[(pid_flags.index > beginDT) & (pid_flags.index < endDT)] = qcFlag
-
-        # Save the results
-        flags_dict.update({pid_name: pid_flags})
-
-    # Add the flag results to the dataset for key in flags_dict
-    for key in flags_dict.keys():
-        # Generate a variable name
-        var_name = "_".join((key.lower(), "annotations", "qc", "results"))
-
-        # Now add to the dataset
-        flags = xr.DataArray(flags_dict.get(key), dims="time")
-        ds[var_name] = flags
-
-    return ds
-
-
-def decimateData(xs,decimationThreshold):
-    xs = xs.dropna('time')
-    # decimate data
-    dec_data_df = decimate.downsample(xs, decimationThreshold)
-    # turn dataframe into dataset
-    dec_data = xr.Dataset.from_dataframe(dec_data_df, sparse=False)
-    dec_data = dec_data.swap_dims({'index': 'time'})
-    dec_data = dec_data.reset_coords()
-    dec_data.attrs = xs.attrs
-
-    return dec_data
-
-
-def exportTables(qartodDict,site,node,sensor,qartod_tests):
-
-    headers = {}
-    headers['gross_range'] = ['subsite', 'node', 'sensor', 'stream', 'parameters', 'qcConfig', 'source', 'notes']
-    headers['climatology'] = ['subsite', 'node', 'sensor', 'stream', 'parameters', 'climatologyTable', 'source', 'notes']
-    testOrder = {'lookup': 0,'table': 1}
-
-    folderPath = os.path.join(os.path.expanduser('~'), 'qartod_staging')
-    folderPath = os.path.abspath(folderPath)
-    if not os.path.exists(folderPath):
-        os.makedirs(folderPath)
-
-    for param in qartodDict:
-        for test in qartodDict[param]:
-            output = qartod_tests[test]['output']
-            print('output: ', output)
-            for fileOut in output:
-                print('fileOut ', fileOut)
-                if 'lookup' in fileOut:
-                    for method in qartodDict[param][test]:
-                        print('method: ', method)
-                        qartod_csv_name = '-'.join([site,node,sensor,param]) + '.' + test + '.csv' + '.' + method
-                        qartod_csv = os.path.join(folderPath, qartod_csv_name)
-                        print('exporting ',qartod_csv)
-                        if len(output) > 1:
-                            if 'binned' in method:
-                                with open(qartod_csv, 'w') as lkup:
-                                    for key in qartodDict[param][test][method]:
-                                        lkup.write(str(key))
-                                        lkup.write(",")
-                                        qartodRow = qartodDict[param][test][method][key][testOrder[fileOut]]
-                                        if isinstance(qartodRow, str):
-                                            lkup.write(qartodRow)
-                                        else:
-                                            lkup.write(qartodRow.to_string())
-                                        lkup.write("\n")
-                            else:
-                                qartodOut = qartodDict[param][test][method][testOrder[fileOut]]
-                                qartodOut.to_csv(qartod_csv, index=False, columns = headers[test])
-                        else:
-                            if 'binned' in method:
-                                with open(qartod_csv, 'w') as lkup:
-                                    for key in qartodDict[param][test][method]:
-                                        lkup.write(str(key))
-                                        lkup.write(",")
-                                        qartodRow = qartodDict[param][test][method][key]
-                                        if isinstance(qartodRow, str):
-                                            lkup.write(qartodRow)
-                                        else:
-                                            lkup.write(qartodRow.to_string())
-                                        lkup.write("\n")
-                            else:
-                                qartodOut = qartodDict[param][test][method]
-                                qartodOut.to_csv(qartod_csv, index=False, columns = headers[test])
-
-                elif 'table' in fileOut:
-                    for method in qartodDict[param][test]:
-                        print('method: ', method)
-                        qartod_csv_name = '-'.join([site,node,sensor,param]) + '.' + test + '.csv' + '.' + method
-                        qartod_csv = os.path.join(folderPath, qartod_csv_name)
-                        print('exporting ', qartod_csv)
-                        if len(output) > 1:
-                            if 'binned' in method:
-                                with open(qartod_csv, 'w') as tbl:
-                                    for key in qartodDict[param][test][method]:
-                                        tbl.write(str(key))
-                                        tbl.write(",")
-                                        qartodRow = qartodDict[param][test][method][key][testOrder[fileOut]]
-                                        tbl.write(','.join(qartodRow))
-                                        tbl.write("\n")
-                            else:
-                                qartodOut = qartodDict[param][test][method][testOrder[fileOut]]
-                                with open(qartod_csv, 'w') as tbl:
-                                    for qartodRow in qartodOut:   
-                                        tbl.write(qartodRow)
-
-                        else:
-                            if 'binned' in method:
-                                with open(qartod_csv, 'w') as tbl:
-                                    for key in qartodDict[param][test][method]:
-                                        tbl.write(str(key))
-                                        tbl.write(",")
-                                        qartodRow = qartodDict[param][test][method][key]
-                                        tbl.write(qartodRow)
-                                        tbl.write("\n")
-                            else:
-                                qartodOut = qartodDict[param][test][method]
-                                with open(qartod_csv, 'w') as tbl:
-                                    for qartodRow in qartodOut:
-                                        tbl.write(qartodRow)
+    site   = kwargs.get('site')
+    node   = kwargs.get('node')
+    sensor = kwargs.get('sensor')
+    stream = kwargs.get('stream')
+    was_decimated = kwargs.get('was_decimated', False)
+    original_points = kwargs.get('original_points', None)
+    final_points = kwargs.get('final_points', None)
     
-    return
-
-
-def filterData(data, node, site, sensor, param, cut_off, annotations, pidDict):
-
-    index = 1
-
-    annotations = annotations.drop(columns=['@class'])
-    annotations['beginDate'] = pd.to_datetime(annotations.beginDT, unit='ms').dt.strftime('%Y-%m-%dT%H:%M:%S')
-    annotations['endDate'] = pd.to_datetime(annotations.endDT, unit='ms').dt.strftime('%Y-%m-%dT%H:%M:%S')
-
-    # create an annotation-based quality flag
-    data = add_annotation_qc_flags(data, annotations, pidDict)
-
-    # clean-up the data, NaN-ing values that were marked as fail in the QC checks and/or identified as a block
-    # of failed data, and then removing all records where the rollup annotation (every parameter fails) was
-    # set to fail.
-    qcVar_summary_string = param + '_qc_summary_flag'
-    if 'qcVar_sumamry_string' in data.variables:
-        m = data[qcVar_summary_string] == 4
-        data[param][m] = np.nan
-    qcVar_results_string = param + '_qc_results'
-    if qcVar_results_string in data.variables:
-        m = data[qcVar_results_string] == 4
-        data[param][m] = np.nan
-
-    if 'rollup_annotations_qc_results' in data.variables:
-        data = data.where(data.rollup_annotations_qc_results < 4)
- 
-    annotations_flag_string = param + '_annotations_qc_results'
-    if annotations_flag_string in data.variables:
-        data = data.where(data[annotations_flag_string] < 3)
-
-    # if a cut_off date was used, limit data to all data collected up to the cut_off date.
-    # otherwise, set the limit to the range of the downloaded data.
-    if cut_off:
-        cut = parser.parse(cut_off)
-        cut = cut.astimezone(pytz.utc)
-        end_date = cut.strftime('%Y-%m-%dT%H:%M:%S')
-        src_date = cut.strftime('%Y-%m-%d')
-    else:
-        cut = parser.parse(data.time_coverage_end)
-        cut = cut.astimezone(pytz.utc)
-        end_date = cut.strftime('%Y-%m-%dT%H:%M:%S')
-        src_date = cut.strftime('%Y-%m-%d')
-
-    data = data.sel(time=slice('2014-01-01T00:00:00', end_date))
-
-    return data
-
-def get_s3_kwargs():
-    aws_key = os.environ.get("AWS_KEY")
-    aws_secret = os.environ.get("AWS_SECRET")
-
-    s3_kwargs = {'key': aws_key, 'secret': aws_secret}
-    return s3_kwargs
-
-
-def inputs(argv=None):
-    if argv is None:
-        argv = sys.argv[1:]
-
-    # initialize argument parser
-    inputParser = argparse.ArgumentParser(
-        description="""Download and process instrument data to generate QARTOD lookup tables""")
-
-    # assign input arguments.
-    inputParser.add_argument("-rd", "--refDes", dest="refDes", type=str, required=True)
-    inputParser.add_argument("-co", "--cut_off", dest="cut_off", type=str, required=False)
-    inputParser.add_argument("-d", "--decThreshold", dest="decThreshold", type=str, required=True)
-    inputParser.add_argument("-v", "--userVars", dest="userVars", type=str, required=True)
-
-    # parse the input arguments and create a parser object
-    args = inputParser.parse_args(argv)
- 
-    return args
-
-
-def loadAnnotations(site):
-    logger.info(f"loading annotations for {site}")
-    anno = {}
-    fs = s3fs.S3FileSystem(**get_s3_kwargs())
-    INPUT_BUCKET = 'ooi-data/'
-    annoFile = INPUT_BUCKET + 'annotations/' + site + '.json'
-    if fs.exists(annoFile):
-        anno_store = fs.open(annoFile)
-        anno = json.load(anno_store)
-        anno = pd.DataFrame(anno)
-    else:
-        print(f"error retrieving annotation history for {site}")
+    logger.debug(f"Running QARTOD test: {test} for {param}")
     
-
-    return anno
-
-
-def loadData(zarrDir):
-    fs = s3fs.S3FileSystem(**get_s3_kwargs())
-    zarr_store = fs.get_mapper('ooi-data/' + zarrDir)
-    ds = xr.open_zarr(zarr_store, consolidated=True)
-
-    return ds
-
-def loadPID():
-    pidRawFile = 'https://raw.githubusercontent.com/oceanobservatories/preload-database/refs/heads/master/csv/ParameterDefs.csv'
-    pidDict = pd.read_csv(pidRawFile,usecols=['netcdf_name','id']).set_index('id').T.to_dict()
-
-    return pidDict
-
-
-def processData(data,param):
-    print('in the processData loop: ', param)
-
-    return data
-
-
-def runQartod(test,data,param,limits,site,node,sensor,stream):
-
-    logger.info(f"running {test} for {param}")
-    logger.info(f"data: {data} ")
-
-    if 'gross_range' in test:
-        qartodResults = process_gross_range(data, [param], limits, site=site,
-                                        node=node, sensor=sensor, stream=stream)
-
-    elif 'climatology' in test:
-        clm_lookup, clm_table = process_climatology(data, [param], limits, site=site,
-                                                    depth_bins = np.array([]), node=node,
-                                                    sensor=sensor, stream=stream)
-        qartodResults = [clm_lookup, clm_table]
+    qartod_results = None
+    
+    try:
+        if TEST_GROSS_RANGE in test:
+            qartod_results = gr.process_gross_range(
+                data, param, limits, 
+                site=site, node=node, sensor=sensor, stream=stream,
+                was_decimated=was_decimated, 
+                original_points=original_points,
+                final_points=final_points
+            )
         
-
-    return qartodResults
-
-
-def main(argv=None):
-    # setup input arguments
-    args = inputs(argv)
-    refDes = args.refDes
-    cut_off = args.cut_off
-    decThreshold = int(args.decThreshold)
-    userVars = args.userVars
-
-    # load parameter dictionaries
-    param_dict = (pd.read_csv('parameterMap.csv',converters={"variables": literal_eval,"limits": literal_eval})).set_index('dataParameter').T.to_dict()
-
-    sites_dict = (pd.read_csv('siteParameters.csv',converters={"variables": literal_eval})).set_index('refDes').T.to_dict('series')
-
-    qartod_tests = (pd.read_csv('qartodTests.csv', converters={"output": literal_eval,"parameters": literal_eval,"profileCalc": literal_eval})).set_index('qartodTest').T.to_dict()
-
-    platform = sites_dict[refDes]['platformType']
-
-    pidDict = loadPID()
-
-    # define sub-variables
-    site, node, port, instrument,method,stream = sites_dict[refDes]['zarrFile'].split('-')
-    sensor = port + '-' + instrument
-
-    # load data
-    data = loadData(sites_dict[refDes]['zarrFile'])
-    allVars = list(data.keys())
-
-    # load annotations
-    annotations = loadAnnotations(refDes)
- 
-    if 'all' in userVars:
-        dataVars=sites_dict[refDes]['variables']
-    else:
-        dataVars = [userVars]
-    
-    paramList = []
-    qartodTests_dict = {}
-    for qcVar in dataVars:
-        qartodTests_dict[qcVar] = {}
-        print(qcVar)
-        qcParam = [i for i in param_dict if qcVar in param_dict[i]['variables']][0]
-        qartodTests_dict[qcVar]['tests'] = {t for t in qartod_tests if qcParam in qartod_tests[t]['parameters']}
-        qartodTests_dict[qcVar]['limits'] = param_dict[qcParam]['limits']
-        for p in param_dict[qcParam]['variables']:
-            paramList.append(p)
-     
-    if 'profiler' in platform:
-        if 'int_ctd_pressure' in data:
-            paramList.append('int_ctd_pressure')
-        elif 'sea_water_pressure' in data:
-            paramList.append('sea_water_pressure')
-
-    dropList = [item for item in allVars if item not in paramList]
-    data = data.drop_vars(dropList)
-    qartodDict = {}
-    
-    if 'fixed' in platform:
-        if ( (len(data['time']) > decThreshold) and (decThreshold > 0) ):
-            data = decimateData(data, decThreshold)
-        for param in dataVars:
-            data = processData(data,param)
-            data = filterData(data, node, site, sensor, param, cut_off, annotations, pidDict)
-            qartodDict[param] = {}
-            for test in qartodTests_dict[param]['tests']:
-                qartodDict[param][test] = {}
-                qartodDict[param][test][platform] = runQartod(test,data,param,qartodTests_dict[param]['limits'],site,node,sensor,stream)
-
-    elif 'profiler' in platform:
-        if 'sea_water_pressure' in data:
-            pressParam = 'sea_water_pressure'
-        elif 'int_ctd_pressure' in data:   
-            pressParam = 'int_ctd_pressure'
+        elif TEST_CLIMATOLOGY in test:
+            qartod_results = ct.process_climatology(
+                data, param, limits,
+                site=site, node=node, sensor=sensor, stream=stream,
+                was_decimated=was_decimated,
+                original_points=original_points,
+                final_points=final_points
+            )
+        
         else:
-            print('no pressure parameter found; unable to bin data!')
-        if 'SF0' in node:
-            shallow_upper = np.arange(6,105,1)  
-            shallow_lower = np.arange(105,200,5)
-            binList = np.concatenate((shallow_upper,shallow_lower), axis=0).tolist()
-        elif 'DP0' in node:
-            maxDepth = {'DP01A': 2900, 'DP01B': 600, 'DP03A': 2600}
-            binList = np.arange(200,maxDepth[node], 5).tolist()
-        bins = []
-        for i in range(0,len(binList)-1):
-            bins.append((binList[i], binList[i+1]))
-
-        for param in dataVars:
-            qartodDict[param] = {}
-            for test in qartodTests_dict[param]['tests']:
-                qartodDict[param][test] = {}
-                if 'integrated' in qartod_tests[test]['profileCalc']:
-                    if ( (len(data['time']) > decThreshold) and (decThreshold > 0) ): 
-                        data = decimateData(data, decThreshold)
-                    data = processData(data,param)
-                    data = filterData(data, node, site, sensor, param, cut_off, annotations, pidDict)
-                    qartodDict[param][test]['int'] = runQartod(test,data,param,qartodTests_dict[param]['limits'],site,node,sensor,stream)
-                
-                if 'binned' in qartod_tests[test]['profileCalc']:
-                    qartodDict[param][test]['binned'] = {}
-                    for pressBin in bins:
-                        print('pressBin: ', pressBin)
-                        data_bin = data.where( (pressBin[0] < data[pressParam].compute()) & (data[pressParam].compute() < pressBin[1]), drop=True )
-            
-                        if (data_bin[pressParam].isnull()).all():
-                            print('no data available for bin: ', pressBin)
-                        else:
-                            if ( (len(data['time']) > decThreshold) and (decThreshold > 0) ):
-                                data_bin = decimateData(data_bin, decThreshold)
-                            data_bin = processData(data_bin,param)
-                            data_bin = filterData(data_bin, node, site, sensor, param, cut_off, annotations, pidDict)
-                            try:
-                                print('trying ', test)
-                                qartodRow = runQartod(test,data_bin,param,qartodTests_dict[param]['limits'],site,node,sensor,stream)
-                            except:
-                                print('failed runQartod for ', test)
-                                qartodRow = 'unable to calculate for pressure bin'
-                            qartodDict[param][test]['binned'][pressBin] = qartodRow
-                       
-    exportTables(qartodDict,site,node,sensor,qartod_tests)    
+            logger.warning(f"Unsupported QARTOD test: {test}")
+            return None
     
+    except Exception as e:
+        logger.error(f"Exception running test {test} for {param}: {e}")
+        traceback.print_exc()
+        return None
+    
+    return qartod_results
+
+
+def run_binned_processing_for_param(
+    data, 
+    param: str, 
+    press_param: str, 
+    bins: List[Tuple[float, float]], 
+    qartod_tests_dict: Dict, 
+    qartod_tests: Dict,
+    site: str, 
+    node: str, 
+    sensor: str, 
+    stream: str, 
+    cut_off: Optional[str], 
+    annotations: pd.DataFrame, 
+    pid_dict: Dict, 
+    dec_threshold: int
+) -> Dict[str, Dict]:
+    """
+    Process a parameter's profile tests for binned and integrated options.
+    
+    Args:
+        data: xarray Dataset
+        param: Parameter name
+        press_param: Pressure parameter name
+        bins: List of (lower, upper) depth bin tuples
+        qartod_tests_dict: Test configuration per parameter
+        qartod_tests: Test definitions
+        site, node, sensor, stream: Platform identifiers
+        cut_off: Optional date cutoff
+        annotations: Annotations DataFrame
+        pid_dict: Parameter ID dictionary
+        dec_threshold: Decimation threshold
+    
+    Returns:
+        Dictionary: {test_name: {'int': ..., 'binned': {bin: result, ...}}}
+    """
+    results_for_param = {}
+    
+    for test in qartod_tests_dict[param]['tests']:
+        results_for_param[test] = {}
+        
+        # ========== INTEGRATED PROCESSING ==========
+        if 'integrated' in qartod_tests[test]['profileCalc']:
+            logger.info(f"Processing integrated test: {test}")
+            
+            # Work on a copy to avoid mutation
+            data_param = data.copy(deep=False)
+            
+            # Track decimation info
+            original_points = len(data_param['time'])
+            was_decimated = False
+            final_points = original_points
+            
+            # Decimate if necessary
+            if (len(data_param['time']) > dec_threshold) and (dec_threshold > 0):
+                data_param = qp.decimateData(data_param, dec_threshold)
+                was_decimated = True
+                final_points = len(data_param['time'])
+            
+            # Process and filter
+            data_param = qp.processData(data_param, param)
+            data_param = qp.filterData(
+                data_param, node, site, sensor, param, 
+                cut_off, annotations, pid_dict
+            )
+            
+            try:
+                results_for_param[test][CALC_INTEGRATED] = runQartod(
+                    test, data_param, param, 
+                    qartod_tests_dict[param]['limits'],
+                    site=site, node=node, sensor=sensor, stream=stream,
+                    was_decimated=was_decimated,
+                    original_points=original_points,
+                    final_points=final_points
+                )
+            except Exception as e:
+                logger.error(f"Integrated test failed: {test}, {param}: {e}")
+                traceback.print_exc()
+                results_for_param[test][CALC_INTEGRATED] = None
+        
+        # ========== BINNED PROCESSING ==========
+        if 'binned' in qartod_tests[test]['profileCalc']:
+            logger.info(f"Processing binned test: {test}")
+            results_for_param[test][CALC_BINNED] = {}
+            
+            for press_bin in bins:
+                logger.info(f"Processing pressure bin: {press_bin}")
+                
+                # Create mask for this depth bin
+                mask = (
+                    (data[press_param] > press_bin[0]) & 
+                    (data[press_param] < press_bin[1])
+                )
+                data_bin = data.where(mask, drop=False)
+                data_bin = data_bin.dropna(dim="time", how="all")
+                
+                qartod_row = None
+                
+                try:
+                    # Check if bin has data
+                    has_data = False
+                    try:
+                        has_data = data_bin[press_param].notnull().any().compute()
+                    except Exception:
+                        has_data = bool(data_bin[press_param].notnull().any())
+                    
+                    if has_data:
+                        # Track decimation info
+                        original_points = len(data_bin['time'])
+                        was_decimated = False
+                        final_points = original_points
+                        
+                        # Decimate based on bin size
+                        if (len(data_bin['time']) > dec_threshold) and (dec_threshold > 0):
+                            data_bin = qp.decimateData(data_bin, dec_threshold)
+                            was_decimated = True
+                            final_points = len(data_bin['time'])
+                        
+                        # Process and filter
+                        data_bin = qp.processData(data_bin, param)
+                        data_bin = qp.filterData(
+                            data_bin, node, site, sensor, param,
+                            cut_off, annotations, pid_dict
+                        )
+                        
+                        # Run QARTOD on bin
+                        qartod_row = runQartod(
+                            test, data_bin, param,
+                            qartod_tests_dict[param]['limits'],
+                            site=site, node=node, sensor=sensor, stream=stream,
+                            was_decimated=was_decimated,
+                            original_points=original_points,
+                            final_points=final_points
+                        )
+                    else:
+                        logger.info(f"No data for pressure bin: {press_bin}")
+                
+                except Exception as e:
+                    logger.error(f"Failed to process bin {press_bin} for {test}: {e}")
+                    traceback.print_exc()
+                
+                # Store result (may be None)
+                results_for_param[test][CALC_BINNED][press_bin] = qartod_row
+    
+    return results_for_param
+
+
+def _setup_profiler_bins(node: str) -> List[float]:
+    """
+    Create depth bins based on profiler node type.
+    
+    Args:
+        node: Node designator (e.g., 'SF01A', 'DP01A')
+    
+    Returns:
+        List of depth boundaries
+    """
+    if 'SF0' in node:
+        # Shallow profiler: fine resolution near surface
+        shallow_upper = np.arange(6, 8, 1)
+        shallow_lower = np.arange(10, 15, 5)
+        return np.concatenate((shallow_upper, shallow_lower), axis=0).tolist()
+    
+    elif 'DP0' in node:
+        # Deep profiler: bins every 5m to max depth
+        max_depth = {
+            'DP01A': 2900, 
+            'DP01B': 600, 
+            'DP03A': 2600
+        }
+        max_d = max_depth.get(node, 2000)
+        return np.arange(200, max_d, 5).tolist()
+    
+    else:
+        # Default binning
+        logger.warning(f"Unknown profiler node type: {node}, using default binning")
+        return np.arange(0, 200, 10).tolist()
+
+
+def runQartod_driver_main():
+    """
+    Main driver function for QARTOD processing.
+    
+    Orchestrates:
+    1. Load configuration and data
+    2. Process fixed or profiler platforms
+    3. Export results to CSV tables
+    """
+    logger.info("=" * 60)
+    logger.info("QARTOD Processing Started")
+    logger.info("=" * 60)
+    
+    # Parse command line arguments
+    args = qp.inputs()
+    ref_des = args.refDes
+    cut_off = args.cut_off
+    dec_threshold = int(args.decThreshold)
+    user_vars = args.userVars
+    
+    logger.info(f"Reference Designator: {ref_des}")
+    logger.info(f"Decimation Threshold: {dec_threshold}")
+    logger.info(f"User Variables: {user_vars}")
+    if cut_off:
+        logger.info(f"Cut-off Date: {cut_off}")
+    
+    # Load configuration files
+    logger.info("Loading configuration files...")
+    
+    param_dict = (
+        pd.read_csv(
+            'parameterMap.csv', 
+            converters={"variables": literal_eval, "limits": literal_eval}
+        )
+        .set_index('dataParameter')
+        .T.to_dict()
+    )
+    
+    sites_dict = (
+        pd.read_csv(
+            'siteParameters.csv', 
+            converters={"variables": literal_eval}
+        )
+        .set_index('refDes')
+        .T.to_dict('series')
+    )
+    
+    qartod_tests = (
+        pd.read_csv(
+            'qartodTests.csv',
+            converters={
+                "output": literal_eval,
+                "parameters": literal_eval,
+                "profileCalc": literal_eval
+            }
+        )
+        .set_index('qartodTest')
+        .T.to_dict()
+    )
+    
+    # Validate reference designator
+    if ref_des not in sites_dict:
+        logger.error(f"Reference designator not found: {ref_des}")
+        raise ValueError(f"Unknown reference designator: {ref_des}")
+    
+    # Extract platform information
+    platform = sites_dict[ref_des]['platformType']
+    logger.info(f"Platform Type: {platform}")
+    
+    # Load parameter ID dictionary
+    pid_dict = qp.loadPID()
+    
+    # Parse zarr file path
+    zarr_file = sites_dict[ref_des]['zarrFile']
+    site, node, port, instrument, method, stream = zarr_file.split('-')
+    sensor = f'{port}-{instrument}'
+    
+    logger.info(f"Site: {site}, Node: {node}, Sensor: {sensor}, Stream: {stream}")
+    
+    # Load data and annotations
+    logger.info("Loading data...")
+    data = qp.loadData(zarr_file)
+    
+    logger.info("Loading annotations...")
+    annotations = qp.loadAnnotations(ref_des)
+    
+    # Determine variables to process
+    if 'all' in user_vars:
+        data_vars = sites_dict[ref_des]['variables']
+        logger.info(f"Processing all variables: {data_vars}")
+    else:
+        data_vars = [user_vars]
+        logger.info(f"Processing single variable: {user_vars}")
+    
+    # Build QARTOD test configuration for each variable
+    param_list = []
+    qartod_tests_dict = {}
+    
+    for qc_var in data_vars:
+        qartod_tests_dict[qc_var] = {}
+        
+        # Find matching parameter configuration
+        qc_param_list = [
+            i for i in param_dict 
+            if qc_var in param_dict[i]['variables']
+        ]
+        
+        if not qc_param_list:
+            logger.warning(f"Variable not found in parameter map: {qc_var}")
+            continue
+        
+        qc_param = qc_param_list[0]
+        
+        # Get tests applicable to this parameter
+        qartod_tests_dict[qc_var]['tests'] = {
+            t for t in qartod_tests 
+            if qc_param in qartod_tests[t]['parameters']
+        }
+        
+        qartod_tests_dict[qc_var]['limits'] = param_dict[qc_param]['limits']
+        
+        # Add all parameter variables to keep list
+        for p in param_dict[qc_param]['variables']:
+            param_list.append(p)
+        
+        logger.info(f"Variable {qc_var}: {len(qartod_tests_dict[qc_var]['tests'])} tests")
+    
+    # Add pressure parameter for profilers
+    if PLATFORM_PROFILER in platform:
+        if 'int_ctd_pressure' in data:
+            param_list.append('int_ctd_pressure')
+            logger.info("Added pressure parameter: int_ctd_pressure")
+        elif 'sea_water_pressure' in data:
+            param_list.append('sea_water_pressure')
+            logger.info("Added pressure parameter: sea_water_pressure")
+    
+    # Drop unused variables to save memory
+    all_vars = list(data.keys())
+    drop_list = [item for item in all_vars if item not in param_list]
+    if drop_list:
+        data = data.drop_vars(drop_list)
+        logger.info(f"Dropped {len(drop_list)} unused variables")
+    
+    # Initialize results dictionary
+    qartod_dict = {}
+    
+    # ========== FIXED PLATFORM PROCESSING ==========
+    if PLATFORM_FIXED in platform:
+        logger.info("Processing FIXED platform")
+        press_param = None
+        
+        # Track decimation info
+        original_points = len(data['time'])
+        was_decimated = False
+        final_points = original_points
+        
+        # Decimate entire dataset once
+        if ((len(data['time']) > dec_threshold) and (dec_threshold > 0)):
+            data = qp.decimateData(data, dec_threshold)
+            was_decimated = True
+            final_points = len(data['time'])
+        
+        for param in data_vars:
+            if param not in qartod_tests_dict:
+                continue
+            
+            logger.info(f"Processing parameter: {param}")
+            qartod_dict[param] = {}
+            
+            # Work on a copy for this parameter
+            data_param = data.copy(deep=False)
+            data_param = qp.processData(data_param, param)
+            data_param = qp.filterData(
+                data_param, node, site, sensor, param,
+                cut_off, annotations, pid_dict
+            )
+            
+            for test in qartod_tests_dict[param]['tests']:
+                qartod_dict[param][test] = {}
+                
+                try:
+                    qartod_dict[param][test][platform] = runQartod(
+                        test, data_param, param,
+                        qartod_tests_dict[param]['limits'],
+                        site=site, node=node, sensor=sensor, stream=stream,
+                        was_decimated=was_decimated,
+                        original_points=original_points,
+                        final_points=final_points
+                    )
+                except Exception as e:
+                    logger.error(f"Test failed for {param}/{test}: {e}")
+                    traceback.print_exc()
+                    qartod_dict[param][test][platform] = None
+    
+    # ========== PROFILER PLATFORM PROCESSING ==========
+    elif PLATFORM_PROFILER in platform:
+        logger.info("Processing PROFILER platform")
+        
+        # Determine pressure parameter
+        if 'sea_water_pressure' in data:
+            press_param = 'sea_water_pressure'
+        elif 'int_ctd_pressure' in data:
+            press_param = 'int_ctd_pressure'
+        else:
+            logger.error(f"No pressure parameter found for profiler: {ref_des}")
+            raise RuntimeError(
+                'No pressure parameter found (sea_water_pressure or int_ctd_pressure). '
+                'Unable to bin profiler data!'
+            )
+        
+        logger.info(f"Using pressure parameter: {press_param}")
+        
+        # Create depth bins
+        bin_list = _setup_profiler_bins(node)
+        bins = [(bin_list[i], bin_list[i + 1]) for i in range(len(bin_list) - 1)]
+        
+        logger.info(f"Created {len(bins)} depth bins")
+        
+        # Process each parameter with binning
+        for param in data_vars:
+            if param not in qartod_tests_dict:
+                continue
+            
+            logger.info(f"Processing parameter: {param}")
+            qartod_dict[param] = {}
+            
+            results_for_param = run_binned_processing_for_param(
+                data, param, press_param, bins, 
+                qartod_tests_dict, qartod_tests,
+                site, node, sensor, stream, 
+                cut_off, annotations, pid_dict, dec_threshold
+            )
+            
+            qartod_dict[param] = results_for_param
+    
+    else:
+        logger.error(f"Unknown platform type: {platform}")
+        raise ValueError(f"Unknown platform type: {platform}")
+    
+    # ========== EXPORT RESULTS ==========
+    logger.info("Exporting results...")
+    logger.debug("QARTOD Results Summary:")
+    for param in qartod_dict:
+        logger.debug(f"  {param}: {list(qartod_dict[param].keys())}")
+    
+    ex.exportTables(
+        qartod_dict, qartod_tests_dict, 
+        site, node, sensor, stream, 
+        platform, press_param
+    )
+    
+    logger.info("=" * 60)
+    logger.info("QARTOD Processing Complete")
+    logger.info("=" * 60)
+
 
 if __name__ == '__main__':
-    main()
+    try:
+        runQartod_driver_main()
+    except Exception as e:
+        logger.error(f"QARTOD processing failed: {e}")
+        traceback.print_exc()
+        sys.exit(1)
