@@ -19,6 +19,7 @@ import qartodProcessing as qp
 import grossRange as gr
 import climatology as ct
 import export as ex
+import sys
 
 # Platform types
 PLATFORM_FIXED = 'fixed'
