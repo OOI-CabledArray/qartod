@@ -46,6 +46,27 @@ def _ensure_chunked(ds, chunk_size=DEFAULT_CHUNK_SIZE):
     return ds
 
 
+def _remove_nans_from_dask_array(darr):
+    """
+    Remove NaN values from a Dask array.
+    
+    Args:
+        darr: Dask array potentially containing NaNs
+    
+    Returns:
+        Dask array with NaNs removed (1D, flattened)
+    """
+    # Flatten array and create mask for non-NaN values
+    darr_flat = darr.flatten()
+    mask = ~da_np.isnan(darr_flat)
+    
+    # Use compress to keep only non-NaN values
+    # Note: This returns a 1D array
+    darr_clean = darr_flat[mask]
+    
+    return darr_clean
+
+
 def _check_normality(darr):
     """
     Test if data is approximately normally distributed.
@@ -55,16 +76,25 @@ def _check_normality(darr):
     - Excess kurtosis should be close to 0 (normal tail behavior)
     
     Args:
-        darr: Dask array of data
+        darr: Dask array of data (may contain NaNs)
     
     Returns:
         tuple: (is_normal, skew, excess_kurt)
     """
     logger.debug("Computing normality statistics...")
     
+    # Remove NaNs before computing statistics
+    darr_clean = _remove_nans_from_dask_array(darr)
+    
     with ProgressBar():
-        skew = da_stats.skew(darr, axis=0).compute()
-        kurt = da_stats.kurtosis(darr, axis=0).compute()
+        # Dask stats functions don't support nan_policy, so we work with clean data
+        skew = da_stats.skew(darr_clean).compute()
+        kurt = da_stats.kurtosis(darr_clean).compute()
+    
+    # Ensure we have scalar values, not NaN
+    if np.isnan(skew) or np.isnan(kurt):
+        logger.warning("NaN detected in skewness or kurtosis - assuming non-normal")
+        return False, skew, np.nan
     
     # Convert to excess kurtosis (normal distribution has excess kurtosis = 0)
     excess_kurt = kurt - 3.0
@@ -85,20 +115,28 @@ def _compute_percentile_range(darr):
     Compute range using percentiles for non-normal data.
     
     Args:
-        darr: Dask array of data
+        darr: Dask array of data (may contain NaNs)
     
     Returns:
         tuple: (lower, upper)
     """
     logger.info("Using percentile-based range (non-normal distribution)")
     
-    with ProgressBar():
-        lower = da_np.percentile(darr, PERCENTILE_LOWER).compute()
-        upper = da_np.percentile(darr, PERCENTILE_UPPER).compute()
+    # Remove NaNs before computing percentiles
+    darr_clean = _remove_nans_from_dask_array(darr)
     
-    # Ensure values are scalars
+    with ProgressBar():
+        # Use regular percentile on clean data
+        lower = da_np.percentile(darr_clean, PERCENTILE_LOWER).compute()
+        upper = da_np.percentile(darr_clean, PERCENTILE_UPPER).compute()
+    
+    # Ensure values are scalars and not NaN
     lower = float(lower)
     upper = float(upper)
+    
+    if np.isnan(lower) or np.isnan(upper):
+        logger.error("NaN values in percentile calculation")
+        raise ValueError("Percentile calculation resulted in NaN")
     
     return lower, upper
 
@@ -108,7 +146,7 @@ def _compute_normal_range(da):
     Compute range using mean ± 3σ for normal data.
     
     Args:
-        da: xarray DataArray
+        da: xarray DataArray (may contain NaNs)
     
     Returns:
         tuple: (lower, upper, mean, std)
@@ -116,16 +154,22 @@ def _compute_normal_range(da):
     logger.info("Using mean ± 3σ range (normal distribution)")
     
     with ProgressBar():
-        mu = da.mean().compute()
-        sd = da.std().compute()
+        # xarray's mean and std handle NaNs by default with skipna=True
+        mu = da.mean(skipna=True).compute()
+        sd = da.std(skipna=True).compute()
     
     # Ensure values are scalars
     mu = float(mu)
     sd = float(sd)
     
+    # Check for NaN results
+    if np.isnan(mu) or np.isnan(sd):
+        logger.error("NaN values in mean/std calculation")
+        raise ValueError("Mean/std calculation resulted in NaN")
+    
     # Handle edge cases
-    if np.isnan(sd) or sd == 0:
-        logger.warning("Standard deviation is zero or NaN - data is constant")
+    if sd == 0:
+        logger.warning("Standard deviation is zero - data is constant")
         return mu, mu, mu, sd
     
     lower = mu - NORMAL_STD_MULTIPLIER * sd
@@ -187,15 +231,15 @@ def process_gross_range(
     ds = _ensure_chunked(ds)
     da = ds[param]
     
-    # Apply sensor range filter and remove NaN values (lazy operations)
-    da_filtered = da.where(
+    # Create boolean mask for valid data
+    valid_mask = (
         (da > sensor_range[0]) &
         (da < sensor_range[1]) &
         (~np.isnan(da))
     )
     
     # Check if any data remains after filtering
-    data_count = da_filtered.count().compute()
+    data_count = valid_mask.sum().compute()
     if data_count == 0:
         logger.error(f"[GROSS_RANGE] No valid data for {param} after filtering")
         return {
@@ -206,27 +250,39 @@ def process_gross_range(
     
     logger.info(f"[GROSS_RANGE] Processing {data_count} valid data points")
     
+    # Apply mask - this creates an array with NaNs where mask is False
+    da_filtered = da.where(valid_mask)
+    
     # Get underlying dask array
     darr = da_filtered.data
     
-    # Check normality
-    is_normal, skew, excess_kurt = _check_normality(darr)
-    
-    # Compute range based on distribution type
-    if not is_normal:
-        lower, upper = _compute_percentile_range(darr)
-        notes = (
-            f"Non-normal distribution (skew={skew:.3f}, excess_kurt={excess_kurt:.3f}): "
-            f"using {PERCENTILE_LOWER}th and {PERCENTILE_UPPER}th percentiles "
-            f"(99.7% coverage)."
-        )
-    else:
-        lower, upper, mu, sd = _compute_normal_range(da_filtered)
-        notes = (
-            f"Normal distribution (skew={skew:.3f}, excess_kurt={excess_kurt:.3f}): "
-            f"using mean ± {NORMAL_STD_MULTIPLIER} standard deviations "
-            f"(μ={mu:.2f}, σ={sd:.2f})."
-        )
+    try:
+        # Check normality (will handle NaNs internally)
+        is_normal, skew, excess_kurt = _check_normality(darr)
+        
+        # Compute range based on distribution type
+        if not is_normal:
+            lower, upper = _compute_percentile_range(darr)
+            notes = (
+                f"Non-normal distribution (skew={skew:.3f}, excess_kurt={excess_kurt:.3f}): "
+                f"using {PERCENTILE_LOWER}th and {PERCENTILE_UPPER}th percentiles "
+                f"(99.7% coverage)."
+            )
+        else:
+            lower, upper, mu, sd = _compute_normal_range(da_filtered)
+            notes = (
+                f"Normal distribution (skew={skew:.3f}, excess_kurt={excess_kurt:.3f}): "
+                f"using mean ± {NORMAL_STD_MULTIPLIER} standard deviations "
+                f"(μ={mu:.2f}, σ={sd:.2f})."
+            )
+        
+    except ValueError as e:
+        logger.error(f"[GROSS_RANGE] Error in statistical calculation: {e}")
+        return {
+            "lower": sensor_range[0],
+            "upper": sensor_range[1],
+            "notes": f"Statistical calculation failed: {str(e)} - using sensor limits"
+        }
     
     # Enforce vendor sensor limits
     original_lower, original_upper = lower, upper
