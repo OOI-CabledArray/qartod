@@ -55,6 +55,8 @@ def _compute_monthly_std(da):
     Returns an xarray DataArray indexed by 'month' (1..12), lazy.
     
     Handles cyclic boundary (December→January) with proper interpolation.
+    
+    Uses sequential indexing for interpolation to avoid non-monotonic error.
     """
     da = _auto_chunk_time(da)
 
@@ -70,18 +72,35 @@ def _compute_monthly_std(da):
     # Rechunk month to a single chunk for interpolation (safe)
     g = g.chunk({"month": -1})
 
-    # IMPROVED: Better cyclic boundary handling
-    # Pad with wrap-around values for proper cyclic interpolation
-    # This ensures December → January continuity
+    # Cyclic boundary handling with sequential indexing
+    # This avoids the "Index 'month' must be monotonically increasing" error
     if g.isnull().any():
         # Create padded array: [Nov, Dec, Jan...Dec, Jan, Feb]
-        padded = xr.concat([g[-2:], g, g[:2]], dim='month')
-        # Interpolate in padded space
-        padded = padded.interpolate_na(dim="month", method="linear", max_gap=None)
-        # Extract the middle 12 months
-        g = padded[2:14]
-        # Reset month coordinate to 1..12
-        g = g.assign_coords(month=np.arange(1, 13))
+        # Using month values: [11, 12, 1, 2, 3, ..., 12, 1, 2]
+        pad_start = g.sel(month=[11, 12])
+        pad_end = g.sel(month=[1, 2])
+        padded = xr.concat([pad_start, g, pad_end], dim='month')
+        
+        # Create sequential index (0, 1, 2, ..., 15) to make it monotonically increasing
+        padded_values = padded.values
+        padded_sequential = xr.DataArray(
+            padded_values,
+            dims=['month'],
+            coords={'month': np.arange(len(padded_values))}
+        )
+        
+        # Now interpolation will work because index is sequential
+        padded_sequential = padded_sequential.interpolate_na(dim="month", method="linear", max_gap=None)
+        
+        # Extract the middle 12 months (indices 2-13)
+        g_interpolated = padded_sequential.isel(month=slice(2, 14))
+        
+        # Restore the original month coordinate (1..12)
+        g = xr.DataArray(
+            g_interpolated.values,
+            dims=['month'],
+            coords={'month': np.arange(1, 13)}
+        )
 
     # Return xarray DataArray (still lazy)
     return g
@@ -162,7 +181,7 @@ def _compute_monthly_fit(monthly_means):
     Uses harmonic regression with 4 cycles. If regression fails (R² < 0.15)
     or cannot be computed, falls back to raw monthly means.
     
-    FIXED: Now uses all computed harmonic coefficients (not just first 5).
+    Uses all computed harmonic coefficients (not just first 5).
 
     Args:
         monthly_means: pandas Series or xarray DataArray with 12 monthly values
@@ -184,7 +203,7 @@ def _compute_monthly_fit(monthly_means):
         logger.info(f"Using raw monthly means (R²={r2:.3f if r2 else 'N/A'} < {MIN_R2_THRESHOLD})")
         return monthly_means.groupby(monthly_means.index).mean().reindex(np.arange(1, 13)), r2
 
-    # FIXED: Use ALL harmonic coefficients for better fit
+    # Use ALL harmonic coefficients for better fit
     # Construct fitted monthly climatology
     f = 1 / 12
     t = np.arange(N)
@@ -275,7 +294,7 @@ def process_climatology(ds, param, sensor_range, **kwargs):
     mm = monthly_mean.compute().values
     ms = monthly_std.compute().values
     
-    # FIXED: Proper handling of incorrect array sizes
+    # handling of incorrect array sizes
     if len(mm) != 12:
         logger.error(f"[CLIM] Monthly mean has {len(mm)} values instead of 12")
         # Pad with NaN instead of using np.resize (which cycles values)
