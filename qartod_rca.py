@@ -238,21 +238,29 @@ def run_binned_processing_for_param(
     return results_for_param
 
 
-def _setup_profiler_bins(node: str) -> List[float]:
+def _setup_profiler_bins(node: str, parameter: str = None, max_depth: float = None, min_depth: float = None) -> List[float]:
     """
-    Create depth bins based on profiler node type.
+    Create depth bins based on profiler node type and parameter.
     
     Args:
         node: Node designator (e.g., 'SF01A', 'DP01A')
+        parameter: Optional parameter name (e.g., 'pco2', 'ph')
     
     Returns:
         List of depth boundaries
     """
     if 'SF0' in node:
-        # Shallow profiler: fine resolution near surface
-        shallow_upper = np.arange(6, 105, 1)
-        shallow_lower = np.arange(105, 200, 5)
-        return np.concatenate((shallow_upper, shallow_lower), axis=0).tolist()
+        # Check if parameter requires special binning
+        if parameter and ('pco2' in parameter.lower() or 'ph' in parameter.lower()):
+            # Special binning: 10m intervals from 15-115, then two bins: 115-150 and 150-195
+            shallow_bins = np.arange(15, 115, 10)
+            deep_bins = np.array([115, 150, 195])
+            return np.concatenate((shallow_bins, deep_bins), axis=0).tolist()
+        else:
+            # Shallow profiler: fine resolution near surface
+            shallow_upper = np.arange(6, 105, 1)
+            shallow_lower = np.arange(105, 200, 5)
+            return np.concatenate((shallow_upper, shallow_lower), axis=0).tolist()
     
     elif 'DP0' in node:
         # Deep profiler: bins every 5m to max depth
@@ -266,8 +274,12 @@ def _setup_profiler_bins(node: str) -> List[float]:
     
     else:
         # Default binning
-        logger.warning(f"Unknown profiler node type: {node}, using default binning")
-        return np.arange(0, 200, 10).tolist()
+        if min_depth < 0:
+            min_depth = 0
+        logger.warning(f"Unknown profiler node type: {node}, using default binning between {min_depth} and {max_depth}")
+        if min_depth < 0:
+            min_depth = 0
+        return np.arange(min_depth, max_depth, 5).tolist()
 
 
 def runQartod_driver_main():
@@ -329,6 +341,14 @@ def runQartod_driver_main():
         .set_index('qartodTest')
         .T.to_dict()
     )
+
+    multiParameter_dict = (
+        pd.read_csv(
+            'multiParameters.csv'
+        )
+        .set_index('instrument')
+        .T.to_dict('series')
+    )
     
     # Validate reference designator
     if ref_des not in sites_dict:
@@ -368,6 +388,11 @@ def runQartod_driver_main():
     param_list = []
     qartod_tests_dict = {}
     
+    # Extract parameters from multi-dimensional array
+    if instrument[:6] in multiParameter_dict.keys():
+        logger.info(f"Extracting multi-dimension arrays for {instrument}")
+        data = qp.extractMulti( data, instrument[:6], multiParameter_dict )
+    
     for qc_var in data_vars:
         qartod_tests_dict[qc_var] = {}
         
@@ -399,7 +424,10 @@ def runQartod_driver_main():
     
     # Add pressure parameter for profilers
     if PLATFORM_PROFILER in platform:
-        if 'int_ctd_pressure' in data:
+        if 'bin_depths' in data:
+            param_list.append('bin_depths')
+            logger.info("Added pressure parameter: bin_depths")
+        elif 'int_ctd_pressure' in data:
             param_list.append('int_ctd_pressure')
             logger.info("Added pressure parameter: int_ctd_pressure")
         elif 'sea_water_pressure' in data:
@@ -469,24 +497,21 @@ def runQartod_driver_main():
         logger.info("Processing PROFILER platform")
         
         # Determine pressure parameter
-        if 'sea_water_pressure' in data:
+        if 'bin_depths' in data:
+            press_param = 'bin_depths'
+        elif 'sea_water_pressure' in data:
             press_param = 'sea_water_pressure'
         elif 'int_ctd_pressure' in data:
             press_param = 'int_ctd_pressure'
+
         else:
             logger.error(f"No pressure parameter found for profiler: {ref_des}")
             raise RuntimeError(
-                'No pressure parameter found (sea_water_pressure or int_ctd_pressure). '
+                'No pressure parameter found (bin_depths, sea_water_pressure or int_ctd_pressure). '
                 'Unable to bin profiler data!'
             )
         
         logger.info(f"Using pressure parameter: {press_param}")
-        
-        # Create depth bins
-        bin_list = _setup_profiler_bins(node)
-        bins = [(bin_list[i], bin_list[i + 1]) for i in range(len(bin_list) - 1)]
-        
-        logger.info(f"Created {len(bins)} depth bins")
         
         # Process each parameter with binning
         for param in data_vars:
@@ -495,6 +520,14 @@ def runQartod_driver_main():
             
             logger.info(f"Processing parameter: {param}")
             qartod_dict[param] = {}
+            
+            # Create depth bins
+            max_depth = data[press_param].max(skipna=True).compute()
+            min_depth = data[press_param].min(skipna=True).compute()
+            bin_list = _setup_profiler_bins(node, param, max_depth, min_depth)
+            bins = [(bin_list[i], bin_list[i + 1]) for i in range(len(bin_list) - 1)]
+        
+            logger.info(f"Created {len(bins)} depth bins")
             
             results_for_param = run_binned_processing_for_param(
                 data, param, press_param, bins, 

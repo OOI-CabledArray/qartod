@@ -469,3 +469,22 @@ def processData(data: xr.Dataset, param: str) -> xr.Dataset:
     """
     logger.debug(f"Processing parameter: {param}")
     return data
+
+def extractMulti(data, inst, multi_dict):
+    """
+    Process subparameters from multi-dimensional arrays.
+    
+    Args:
+        data: xarray Dataset
+        inst: Instrument name
+        multi_dict: Dictionary of multi-parameter configurations
+
+    Returns:
+        Processed dataset with subparameters added
+    """
+    multiParam = multi_dict[inst]["parameter"]
+    subParams = multi_dict[inst]["subParameters"].strip('"').split(",")
+    for i in range(0, len(subParams)):
+        newParam = multiParam + "_" + subParams[i]
+        data[newParam] = data[multiParam][:, i]
+    return data
