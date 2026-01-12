@@ -499,6 +499,8 @@ def runQartod_driver_main():
         # Determine pressure parameter
         if 'bin_depths' in data:
             press_param = 'bin_depths'
+        elif 'vadcp_b_bin_depths' in data:
+            press_param = 'vadcp_b_bin_depths'
         elif 'sea_water_pressure' in data:
             press_param = 'sea_water_pressure'
         elif 'int_ctd_pressure' in data:

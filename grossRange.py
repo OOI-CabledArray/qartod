@@ -46,27 +46,6 @@ def _ensure_chunked(ds, chunk_size=DEFAULT_CHUNK_SIZE):
     return ds
 
 
-def _remove_nans_from_dask_array(darr):
-    """
-    Remove NaN values from a Dask array.
-    
-    Args:
-        darr: Dask array potentially containing NaNs
-    
-    Returns:
-        Dask array with NaNs removed (1D, flattened)
-    """
-    # Flatten array and create mask for non-NaN values
-    darr_flat = darr.flatten()
-    mask = ~da_np.isnan(darr_flat)
-    
-    # Use compress to keep only non-NaN values
-    # Note: This returns a 1D array
-    darr_clean = darr_flat[mask]
-    
-    return darr_clean
-
-
 def _check_normality(darr):
     """
     Test if data is approximately normally distributed.
@@ -83,9 +62,13 @@ def _check_normality(darr):
     """
     logger.debug("Computing normality statistics...")
     
+    # Flatten the data array to 1D (removes spatial/temporal dimensions)
+    data_flat = darr.flatten()
+
     # Remove NaNs before computing statistics
-    darr_clean = _remove_nans_from_dask_array(darr)
+    darr_clean = data_flat[~np.isnan(data_flat)]
     
+
     with ProgressBar():
         # Dask stats functions don't support nan_policy, so we work with clean data
         skew = da_stats.skew(darr_clean).compute()
@@ -122,13 +105,18 @@ def _compute_percentile_range(darr):
     """
     logger.info("Using percentile-based range (non-normal distribution)")
     
-    # Remove NaNs before computing percentiles
-    darr_clean = _remove_nans_from_dask_array(darr)
+    # Flatten the data array to 1D (removes spatial/temporal dimensions)
+    data_flat = darr.flatten()
+
+    # Remove NaNs before computing statistics
+    #darr_clean = data_flat[~np.isnan(data_flat)]
+   
+    darr_clean = darr 
     
     with ProgressBar():
         # Use regular percentile on clean data
-        lower = da_np.percentile(darr_clean, PERCENTILE_LOWER).compute()
-        upper = da_np.percentile(darr_clean, PERCENTILE_UPPER).compute()
+        lower = da_np.nanpercentile(darr_clean, PERCENTILE_LOWER, axis=0).compute()
+        upper = da_np.nanpercentile(darr_clean, PERCENTILE_UPPER, axis=0).compute()
     
     # Ensure values are scalars and not NaN
     lower = float(lower)
