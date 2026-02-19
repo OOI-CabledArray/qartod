@@ -9,6 +9,7 @@ Handles both fixed platforms and profiling platforms with depth binning.
 """
 
 from ast import literal_eval
+from curses import window
 import numpy as np
 import pandas as pd
 from loguru import logger
@@ -139,6 +140,14 @@ def run_binned_processing_for_param(
             # Work on a copy to avoid mutation
             data_param = data.copy(deep=False)
             
+            # if param relates to measuring surface light (PAR, SPKIR)
+            # only use values where depth is less than 10 meters for integrated calculations
+            if ('par' in param.lower() or 'spkir' in param.lower()):
+                logger.info(f"Applying surface light depth filter for parameter: {param}")
+                light_mask = data_param[press_param] < 10
+                data_param = data_param.where(light_mask, drop=False)
+                data_param = data_param.dropna(dim="time", how="all")
+                
             # Track decimation info
             original_points = len(data_param['time'])
             was_decimated = False
@@ -146,7 +155,10 @@ def run_binned_processing_for_param(
             
             # Decimate if necessary
             if (len(data_param['time']) > dec_threshold) and (dec_threshold > 0):
-                data_param = qp.decimateData(data_param, dec_threshold)
+                logger.info(f"Applying decimation for parameter: {param}")
+                window = int(len(data_param['time']) / dec_threshold)
+                data_param = data_param.coarsen(time=window, boundary='trim').mean()
+                #data_param = qp.decimateData(data_param, dec_threshold)
                 was_decimated = True
                 final_points = len(data_param['time'])
             
@@ -205,7 +217,10 @@ def run_binned_processing_for_param(
                         
                         # Decimate based on bin size
                         if (len(data_bin['time']) > dec_threshold) and (dec_threshold > 0):
-                            data_bin = qp.decimateData(data_bin, dec_threshold)
+                            logger.info(f"Applying decimation for parameter: {param}")
+                            window = int(len(data_bin['time']) / dec_threshold)
+                            data_bin = data_bin.coarsen(time=window, boundary='trim').mean()
+                            #data_bin = qp.decimateData(data_bin, dec_threshold)
                             was_decimated = True
                             final_points = len(data_bin['time'])
                         

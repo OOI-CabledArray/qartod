@@ -154,22 +154,20 @@ def _harmonic_regression(ts):
 
     # Least squares regression
     beta, resid, rank, s = np.linalg.lstsq(X, ts_fit, rcond=None)
-
-    # Calculate R-squared
-    if ts_fit.size == 0:
+    
+    p = X.shape[1]  # number of predictors
+    
+    if resid.size == 0 or n <= p or rank < p or ts_fit.size == 0:
+        logger.warning(f"Failed harmonic regression: resid.size={resid.size}, n={n}, p={p}, rank={rank}, ts_fit.size={ts_fit.size}")
         r2 = 0.0
-    else:
-        # resid is sum of squared residuals (scalar or 1-element array)
-        rss = float(resid[0]) if (isinstance(resid, np.ndarray) and resid.size > 0) else float(resid)
-        tss = np.sum((ts_fit - ts_fit.mean())**2)
         
-        if tss == 0:
-            # All values identical - model fits perfectly but explains no variance
-            # Set r2 = 0 to indicate constant data
-            r2 = 0.0
-            logger.debug("Constant data detected (TSS=0), setting R²=0")
-        else:
+    else:
+        rss = resid[0]
+        tss = np.sum((ts_fit - ts_fit.mean())**2)
+        if tss > 0:
             r2 = 1.0 - (rss / tss)
+        else:
+            r2 = 0.0
 
     return beta, r2, N
 
@@ -200,7 +198,16 @@ def _compute_monthly_fit(monthly_means):
 
     if beta is None or r2 is None or r2 < MIN_R2_THRESHOLD:
         # Fallback to raw monthly means (ensure index 1..12)
-        logger.info(f"Using raw monthly means (R²={r2:.3f if r2 else 'N/A'} < {MIN_R2_THRESHOLD})")
+        if r2 is None:
+            r2_str = "N/A"
+        else:
+            r2_str = f"{r2:.3f}"
+            
+        logger.info(
+        f"Using raw monthly means (R²={r2_str} < {MIN_R2_THRESHOLD})"
+        )
+        
+        ##logger.info(f"Using raw monthly means (R²={r2:.3f if r2 else 'N/A'} < {MIN_R2_THRESHOLD})")
         return monthly_means.groupby(monthly_means.index).mean().reindex(np.arange(1, 13)), r2
 
     # Use ALL harmonic coefficients for better fit
@@ -280,7 +287,7 @@ def process_climatology(ds, param, sensor_range, **kwargs):
     # Compute monthly statistics
     monthly_mean = _compute_monthly_means(da)
     monthly_std  = _compute_monthly_std(da)
-
+    
     # Compute harmonic fit + R²
     fitted_monthly, r2 = _compute_monthly_fit(monthly_mean)
 
