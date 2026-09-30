@@ -34,6 +34,10 @@ TEST_CLIMATOLOGY = 'climatology'
 CALC_INTEGRATED = 'int'
 CALC_BINNED = 'binned'
 
+# Decimation methods (reported in test notes)
+DEC_LTTB = 'LTTB (Largest Triangle Three Buckets) algorithm'
+DEC_COARSEN = 'xarray coarsen function'
+
 
 def runQartod(test: str, data, param: str, limits: List[float], 
               **kwargs) -> Optional[Dict]:
@@ -45,7 +49,7 @@ def runQartod(test: str, data, param: str, limits: List[float],
         data: xarray Dataset
         param: Parameter name
         limits: Sensor limits [min, max]
-        **kwargs: Additional context (site, node, sensor, stream, was_decimated, original_points, final_points)
+        **kwargs: Additional context (site, node, sensor, stream, was_decimated, original_points, final_points, dec_method)
     
     Returns:
         Dictionary of test results, or None if test not supported
@@ -57,6 +61,7 @@ def runQartod(test: str, data, param: str, limits: List[float],
     was_decimated = kwargs.get('was_decimated', False)
     original_points = kwargs.get('original_points', None)
     final_points = kwargs.get('final_points', None)
+    dec_method = kwargs.get('dec_method')
     
     logger.debug(f"Running QARTOD test: {test} for {param}")
     
@@ -69,7 +74,8 @@ def runQartod(test: str, data, param: str, limits: List[float],
                 site=site, node=node, sensor=sensor, stream=stream,
                 was_decimated=was_decimated, 
                 original_points=original_points,
-                final_points=final_points
+                final_points=final_points,
+                dec_method=dec_method
             )
         
         elif TEST_CLIMATOLOGY in test:
@@ -78,7 +84,8 @@ def runQartod(test: str, data, param: str, limits: List[float],
                 site=site, node=node, sensor=sensor, stream=stream,
                 was_decimated=was_decimated,
                 original_points=original_points,
-                final_points=final_points
+                final_points=final_points,
+                dec_method=dec_method
             )
         
         else:
@@ -176,7 +183,8 @@ def run_binned_processing_for_param(
                     site=site, node=node, sensor=sensor, stream=stream,
                     was_decimated=was_decimated,
                     original_points=original_points,
-                    final_points=final_points
+                    final_points=final_points,
+                    dec_method=DEC_COARSEN
                 )
             except Exception as e:
                 logger.error(f"Integrated test failed: {test}, {param}: {e}")
@@ -238,7 +246,8 @@ def run_binned_processing_for_param(
                             site=site, node=node, sensor=sensor, stream=stream,
                             was_decimated=was_decimated,
                             original_points=original_points,
-                            final_points=final_points
+                            final_points=final_points,
+                            dec_method=DEC_COARSEN
                         )
                     else:
                         logger.info(f"No data for pressure bin: {press_bin}")
@@ -508,7 +517,8 @@ def runQartod_driver_main():
                         site=site, node=node, sensor=sensor, stream=stream,
                         was_decimated=was_decimated,
                         original_points=original_points,
-                        final_points=final_points
+                        final_points=final_points,
+                        dec_method=DEC_LTTB
                     )
                 except Exception as e:
                     logger.error(f"Test failed for {param}/{test}: {e}")

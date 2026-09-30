@@ -142,8 +142,6 @@ The test produces 12 monthly `[lower, upper]` pairs per variable, or 12 per dept
 ### Known issues
 
 - **Kurtosis is offset by 3.** `dask.array.stats.kurtosis` probably returns *excess* kurtosis by default (`fisher=True`, as in scipy), and `grossRange.py` subtracts 3 on top of that. If so, data from a true normal distribution scores about −3 and fails the `-2 < excess kurtosis < 2` check. Nearly every variable would then take the **percentile** path instead of mean ± 5σ. Check which one was used in the `notes` column of a lookup file.
-- **Climatology decimation note.** The climatology note always says the data was decimated with LTTB. Profiler bins are actually decimated with `xarray.coarsen`.
-
 ---
 
 ## Configuration files

@@ -189,7 +189,7 @@ def process_gross_range(
         ds: xarray Dataset containing the parameter data
         param: Name of parameter to analyze
         sensor_range: [min, max] vendor sensor limits
-        **kwargs: Additional context (site, node, sensor, stream, was_decimated, original_points, final_points)
+        **kwargs: Additional context (site, node, sensor, stream, was_decimated, original_points, final_points, dec_method)
     
     Returns:
         Dictionary with keys:
@@ -207,6 +207,7 @@ def process_gross_range(
     was_decimated = kwargs.get('was_decimated', False)
     original_points = kwargs.get('original_points', None)
     final_points = kwargs.get('final_points', None)
+    dec_method = kwargs.get('dec_method', 'unknown method')
     
     logger.info(f"[GROSS_RANGE] Processing {param} for {site}-{node}-{sensor}")
     
@@ -288,8 +289,7 @@ def process_gross_range(
     
     # Add decimation info to notes if data was decimated
     if was_decimated and original_points and final_points:
-        #notes += f" Analysis performed on decimated dataset using LTTB (Largest Triangle Three Buckets) algorithm: {original_points:,} points reduced to {final_points:,} points."
-        notes += f" Analysis performed on decimated dataset using xarray coarsen function: {original_points:,} points reduced to {final_points:,} points."
+        notes += f" Analysis performed on decimated dataset using {dec_method}: {original_points:,} points reduced to {final_points:,} points."
     
     results = {
         "lower": lower,

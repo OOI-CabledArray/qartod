@@ -248,7 +248,7 @@ def process_climatology(ds, param, sensor_range, **kwargs):
         ds: xarray Dataset containing the data
         param: Parameter name to process
         sensor_range: [min, max] sensor limits
-        **kwargs: Additional arguments (site, node, sensor, stream, was_decimated, original_points, final_points)
+        **kwargs: Additional arguments (site, node, sensor, stream, was_decimated, original_points, final_points, dec_method)
     
     Returns:
         Dictionary with 'lower', 'upper' (lists of 12 monthly values), and 'notes'
@@ -262,6 +262,7 @@ def process_climatology(ds, param, sensor_range, **kwargs):
     was_decimated = kwargs.get('was_decimated', False)
     original_points = kwargs.get('original_points', None)
     final_points = kwargs.get('final_points', None)
+    dec_method = kwargs.get('dec_method', 'unknown method')
 
     results = {}
     da = ds[param]
@@ -339,7 +340,7 @@ def process_climatology(ds, param, sensor_range, **kwargs):
     
     # Add decimation info to notes if data was decimated
     if was_decimated and original_points and final_points:
-        note += f" Analysis performed on decimated dataset using LTTB (Largest Triangle Three Buckets) algorithm: {original_points:,} points reduced to {final_points:,} points."
+        note += f" Analysis performed on decimated dataset using {dec_method}: {original_points:,} points reduced to {final_points:,} points."
 
     results = {
         "lower": lower.tolist(),
