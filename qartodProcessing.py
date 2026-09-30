@@ -106,6 +106,13 @@ def inputs(argv=None):
         required=True,
         help="Variables to process ('all' or specific variable name)"
     )
+    inputParser.add_argument(
+        "-t", "--tests",
+        dest="tests",
+        nargs="+",
+        required=False,
+        help="QARTOD test(s) to run (e.g., gross_range). Default: all tests in qartodTests.csv"
+    )
 
     args = inputParser.parse_args(argv)
     

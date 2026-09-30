@@ -357,6 +357,14 @@ def runQartod_driver_main():
         .T.to_dict()
     )
 
+    # Restrict to user-selected tests
+    if args.tests:
+        unknown = set(args.tests) - set(qartod_tests)
+        if unknown:
+            raise ValueError(f"Unknown test(s): {unknown}. Options: {list(qartod_tests)}")
+        qartod_tests = {t: qartod_tests[t] for t in args.tests}
+        logger.info(f"Running selected tests: {args.tests}")
+
     multiParameter_dict = (
         pd.read_csv(
             'multiParameters.csv'

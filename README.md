@@ -18,18 +18,7 @@ export AWS_KEY=<your key>
 export AWS_SECRET=<your secret>
 ```
 
-### 2. Turn off climatology
-
-No command-line flag chooses which test runs. The driver runs every test in `qartodTests.csv` whose `parameters` list includes your variable's parameter category. To run only gross range, delete (or cut out temporarily) the `climatology` row so the file looks like this:
-
-```csv
-qartodTest,output,parameters,profileCalc
-gross_range,"['lookup']","['pressure','temperature', ... ]","['integrated']"
-```
-
-Put the row back afterwards if you want climatology on the next run.
-
-### 3. Run
+### 2. Run
 
 Run from the repo root, because the config CSVs are read with relative paths:
 
@@ -38,7 +27,8 @@ cd qartod
 python3 qartod_rca.py \
     -rd RS01SLBS-LJ01A-12-CTDPFB101 \
     -v sea_water_temperature \
-    -d 0
+    -d 0 \
+    -t gross_range
 ```
 
 | Flag | Required | Meaning |
@@ -46,9 +36,10 @@ python3 qartod_rca.py \
 | `-rd`, `--refDes` | yes | Reference designator. It must be a `refDes` in `siteParameters.csv`. |
 | `-v`, `--userVars` | yes | A single data variable name, such as `sea_water_temperature`, or `all` for every variable listed for that refDes in `siteParameters.csv`. |
 | `-d`, `--decThreshold` | yes | Target number of points after decimation. `0` turns decimation off. |
+| `-t`, `--tests` | no | Test(s) to run: `gross_range`, `climatology`, or both separated by a space. The default is every test in `qartodTests.csv`. A test still runs only on variables whose parameter category is in that test's `parameters` list. |
 | `-co`, `--cut_off` | no | End date (ISO format, e.g. `2024-12-31`). The default is the dataset's `time_coverage_end`. The start date is always `2014-01-01`. |
 
-### 4. Output
+### 3. Output
 
 The files are written to `~/qartod_staging/`:
 
@@ -62,24 +53,96 @@ For the example above, the lookup file is `~/qartod_staging/RS01SLBS-LJ01A-12-CT
 
 ---
 
-## How gross range is calculated
+## How the tests are calculated
 
-The calculation is in `grossRange.py`, in `process_gross_range`:
+### Data preparation (both tests)
 
-1. Data outside the sensor limits (`limits` in `parameterMap.csv`) is dropped.
-2. The code checks normality with skewness and excess kurtosis (`|skew| < 1` and `-2 < excess kurtosis < 2`).
-3. **Normal:** suspect span = mean ± 5σ.
-   **Non-normal:** suspect span = the 0.0000287th to 99.9999713th percentiles, which is about the same coverage as ±5σ.
-4. The result is clipped to the sensor limits.
+Before either test, `qartodProcessing.filterData` masks data that has already been flagged:
 
-To change the width, edit the constants at the top of `grossRange.py` (`NORMAL_STD_MULTIPLIER`, `PERCENTILE_LOWER`, `PERCENTILE_UPPER`). Commented-out 3σ and 4σ presets are there too.
+- values where `<var>_qc_summary_flag` or `<var>_qc_results` is **4** (fail)
+- all variables wherever a rollup annotation (one with no parameters) is flagged fail (4)
+- values where a parameter-specific annotation is suspect (**3**) or worse
 
-Before the calculation, `qartodProcessing.filterData` removes data that failed existing QC. It masks:
-- values where `<var>_qc_summary_flag` or `<var>_qc_results` is 4 (fail)
-- all variables wherever a rollup annotation (one with no parameters) is flagged fail
-- values where a parameter-specific annotation is suspect (3) or worse
+Annotations are read from `s3://ooi-data/annotations/<refDes>.json`. The `exclude` field is not used.
 
-Annotations are read from `s3://ooi-data/annotations/<refDes>.json`.
+It then keeps only data from `2014-01-01` to the cut-off date (`-co`, or the dataset's `time_coverage_end`).
+
+Inside each test, values outside the sensor limits in `parameterMap.csv` are dropped, along with NaNs. The comparison is strict: values exactly at a limit are dropped too.
+
+### Gross range (`grossRange.py`)
+
+The test produces one `[lower, upper]` pair per variable, or one per depth bin for binned profiler runs.
+
+1. **Normality check.** Skewness and excess kurtosis are computed for all remaining values together. The data counts as **normal** when both conditions hold:
+   - `|skewness| < 1.0`
+   - `-2.0 < excess kurtosis < 2.0`
+
+   See [Known issues](#known-issues) about how the kurtosis value is computed.
+2. **Suspect span:**
+
+   | Distribution | Lower | Upper | Coverage |
+   |---|---|---|---|
+   | Normal | mean − **5σ** | mean + **5σ** | 99.99994% |
+   | Non-normal | **0.0000287th** percentile | **99.9999713th** percentile | the same two-sided coverage as ±5σ |
+
+   σ is the population standard deviation of all remaining values (xarray `std`, `ddof=0`). If σ = 0, the span collapses to the mean.
+3. **Clipping.** The span is clipped to the sensor limits.
+4. **Fail span.** The fail span is the sensor limits from `parameterMap.csv`, unchanged.
+
+The lookup file stores these as `{"qartod": {"gross_range_test": {"suspect_span": [lower, upper], "fail_span": [min, max]}}}`, with both suspect-span values rounded to 2 decimals. The `notes` column records the method, skewness, excess kurtosis, μ and σ, whether clipping happened, and whether the data was decimated.
+
+To change the width, edit the constants at the top of `grossRange.py`. Presets for 3σ (0.135 / 99.865 percentiles) and 4σ (0.0032 / 99.9968 percentiles) are in the file, commented out.
+
+| Constant | Current value |
+|---|---|
+| `NORMAL_STD_MULTIPLIER` | `5.0` |
+| `PERCENTILE_LOWER` / `PERCENTILE_UPPER` | `0.0000287` / `99.9999713` |
+| `SKEWNESS_THRESHOLD` | `1.0` |
+| `EXCESS_KURTOSIS_LOWER` / `EXCESS_KURTOSIS_UPPER` | `-2.0` / `2.0` |
+
+If no valid data remains, or the statistics come out as NaN, the suspect span falls back to the sensor limits. The `notes` column says when that happens.
+
+### Climatology (`climatology.py`)
+
+The test produces 12 monthly `[lower, upper]` pairs per variable, or 12 per depth bin for profilers.
+
+1. **Monthly mean and σ.** Every data point in the record is grouped by calendar month, pooling all years (all Januaries together, and so on). For each month, the code computes the mean and the population standard deviation (`ddof=0`). A month with no data has a NaN mean.
+2. **Missing σ.** A NaN monthly σ is filled by linear interpolation from its neighbors, wrapping around the year (December connects to January). Any σ that is still NaN or ≤ 0 is replaced with the median of the valid monthly σ values. If there are none, it becomes 1% of the sensor range. The `notes` column records any replacement.
+3. **Bounds:**
+
+   ```
+   lower[m] = monthly_mean[m] − 3σ[m]
+   upper[m] = monthly_mean[m] + 3σ[m]
+   ```
+
+   The multiplier is **3 standard deviations** (`N_STD_DEVIATIONS = 3`). Both bounds are clipped to the sensor limits. A month with no data gets NaN bounds.
+4. **Harmonic fit (goes in the notes only).** The code also fits a harmonic regression to the 12 monthly means: an intercept plus annual, semi-annual, 4-month and 3-month sine/cosine pairs. The fit needs at least 4 months of data. Its R² goes in the `notes` column. If R² < 0.15, the note says "Using raw monthly means". **The fitted curve is not used for the bounds.** The bounds always come from the raw monthly means in step 3.
+
+| Constant | Current value |
+|---|---|
+| `N_STD_DEVIATIONS` | `3` |
+| `MIN_R2_THRESHOLD` | `0.15` |
+| `MIN_DATA_POINTS` | `4` |
+
+**Profilers.** Climatology is `binned` (set in `qartodTests.csv`), so steps 1–4 run separately for each depth bin. Bins come from `_setup_profiler_bins` in `qartod_rca.py`:
+
+| Node | Bins |
+|---|---|
+| Shallow profiler (`SF0*`) | 1 m bins from 6–105 m, then 5 m bins from 105–195 m |
+| Shallow profiler, pCO2 and pH | 10 m bins from 15–115 m, then 115–150 m and 150–195 m |
+| Deep profiler (`DP0*`) | 5 m bins from 200 m to 2900 m (DP01A), 600 m (DP01B) or 2600 m (DP03A) |
+| Other | 5 m bins from the minimum to the maximum pressure |
+
+**Output.** For each variable, the test writes `<site>-<node>-<sensor>-<var>.climatology_table.csv.<fixed|int|binned>` and a lookup file, `<site>-<node>-<sensor>-<var>-climatology_test_values.csv`.
+- **Table columns:** a header row of months, `[1, 1]` … `[12, 12]`.
+- **Table rows:** one row per depth bin, `[zmin, zmax]`. Fixed platforms have a single `[0, 0]` row.
+- **Cells:** `[lower, upper]`.
+- **Lookup file:** its table path points to `climatology_tables/…climatology_table.csv`, and for profilers it sets `zinp` to the pressure variable.
+
+### Known issues
+
+- **Kurtosis is offset by 3.** `dask.array.stats.kurtosis` probably returns *excess* kurtosis by default (`fisher=True`, as in scipy), and `grossRange.py` subtracts 3 on top of that. If so, data from a true normal distribution scores about −3 and fails the `-2 < excess kurtosis < 2` check. Nearly every variable would then take the **percentile** path instead of mean ± 5σ. Check which one was used in the `notes` column of a lookup file.
+- **Climatology decimation note.** The climatology note always says the data was decimated with LTTB. Profiler bins are actually decimated with `xarray.coarsen`.
 
 ---
 
