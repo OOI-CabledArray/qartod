@@ -17,7 +17,6 @@ import argparse
 import numpy as np
 import pandas as pd
 import sys
-import decimate
 from loguru import logger
 from datetime import datetime
 import dateutil.parser as parser
@@ -223,33 +222,11 @@ def loadData(zarr_dir: str) -> xr.Dataset:
 
 def decimateData(xs: xr.Dataset, decimation_threshold: int) -> xr.Dataset:
     """
-    Decimate dataset using LTTB algorithm.
-    
-    Args:
-        xs: Input dataset
-        decimation_threshold: Target number of points
-    
-    Returns:
-        Decimated dataset
+    Decimate dataset to about decimation_threshold points by block-averaging in time (xarray coarsen).
     """
-    logger.info(f"Decimating data: {len(xs.time)}  {decimation_threshold} points")
-    
-    # Remove NaN time values
-    xs = xs.where(~np.isnan(xs['time']), drop=True)
-    
-    # Perform decimation
-    dec_data_df = decimate.downsample(xs, decimation_threshold)
-    
-    # Convert back to xarray Dataset
-    dec_data = xr.Dataset.from_dataframe(dec_data_df)
-    dec_data = dec_data.swap_dims({'index': 'time'})
-    dec_data = dec_data.reset_coords()
-    
-    # Preserve original attributes
-    dec_data.attrs = xs.attrs
-    
-    logger.info(f"Decimation complete: {len(dec_data.time)} points")
-    
+    window = int(len(xs['time']) / decimation_threshold)
+    dec_data = xs.coarsen(time=window, boundary='trim').mean()
+    logger.info(f"Decimated data: {len(xs.time)} -> {len(dec_data.time)} points")
     return dec_data
 
 
@@ -419,20 +396,6 @@ def filterData(data: xr.Dataset, node: str, site: str, sensor: str,
     
     # Add annotation flags
     data = add_annotation_qc_flags(data, annotations, pid_dict)
-    
-    # Apply QC summary flag
-    qc_summary_var = f'{param}_qc_summary_flag'
-    if qc_summary_var in data.variables:
-        mask = data[qc_summary_var] == QARTOD_FAIL_FLAG
-        data[param] = data[param].where(~mask)
-        logger.debug(f"Applied QC summary filter: {mask.sum().values} points masked")
-    
-    # Apply QC results flag
-    qc_results_var = f'{param}_qc_results'
-    if qc_results_var in data.variables:
-        mask = data[qc_results_var] == QARTOD_FAIL_FLAG
-        data[param] = data[param].where(~mask)
-        logger.debug(f"Applied QC results filter: {mask.sum().values} points masked")
     
     # Apply rollup annotations (affects all parameters)
     if 'rollup_annotations_qc_results' in data.variables:

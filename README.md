@@ -10,7 +10,7 @@ Each run handles one reference designator. It loads the Zarr stream and removes 
 
 ### 1. Environment
 
-Use Python 3. On some machines `python` still points to 2.7, so call `python3` explicitly.
+Use Python 3
 
 ```bash
 pip install xarray dask zarr s3fs pandas numpy loguru python-dateutil pytz
@@ -35,7 +35,7 @@ python3 qartod_rca.py \
 |---|---|---|
 | `-rd`, `--refDes` | yes | Reference designator. It must be a `refDes` in `siteParameters.csv`. |
 | `-v`, `--userVars` | yes | A single data variable name, such as `sea_water_temperature`, or `all` for every variable listed for that refDes in `siteParameters.csv`. |
-| `-d`, `--decThreshold` | yes | Target number of points after decimation. `0` turns decimation off. |
+| `-d`, `--decThreshold` | yes | Target number of points after decimation, by block-averaging in time (`xarray.coarsen`). `0` turns decimation off. |
 | `-t`, `--tests` | no | Test(s) to run: `gross_range`, `climatology`, or both separated by a space. The default is every test in `qartodTests.csv`. A test still runs only on variables whose parameter category is in that test's `parameters` list. |
 | `-co`, `--cut_off` | no | End date (ISO format, e.g. `2024-12-31`). The default is the dataset's `time_coverage_end`. The start date is always `2014-01-01`. |
 
@@ -45,7 +45,7 @@ The files are written to `~/qartod_staging/`:
 
 | File | Contents |
 |---|---|
-| `<site>-<node>-<sensor>-<var>-gross_range_test_values.csv` | Lookup row with `qcConfig`: `suspect_span` (the computed range) and `fail_span` (sensor limits from `parameterMap.csv`), plus notes on the method |
+| `<site>-<node>-<sensor>-<var>-gross_range_test_values.csv` | Lookup row with `qcConfig` `fail_span` (sensor limits from `parameterMap.csv`). The computed statistical range is recorded in the notes, not applied. |
 | `<site>-<node>-<sensor>-<var>.gross_range_table.csv.fixed` | Range table (fixed platforms) |
 | `<site>-<node>-<sensor>-<var>.gross_range_table.csv.int` | Range table (profilers; depth-integrated) |
 
@@ -57,9 +57,8 @@ For the example above, the lookup file is `~/qartod_staging/RS01SLBS-LJ01A-12-CT
 
 ### Data preparation (both tests)
 
-Before either test, `qartodProcessing.filterData` masks data that has already been flagged:
+Before either test, `qartodProcessing.filterData` masks annotated data:
 
-- values where `<var>_qc_summary_flag` or `<var>_qc_results` is **4** (fail)
 - all variables wherever a rollup annotation (one with no parameters) is flagged fail (4)
 - values where a parameter-specific annotation is suspect (**3**) or worse
 
@@ -71,14 +70,16 @@ Inside each test, values outside the sensor limits in `parameterMap.csv` are dro
 
 ### Gross range (`grossRange.py`)
 
-The test produces one `[lower, upper]` pair per variable, or one per depth bin for binned profiler runs.
+The lookup row applies only the **fail span** (sensor limits), as defined in parameterMap.csv. A statistical range is still computed, recorded in the `notes` and the range table, but not exported as a suspect span: it flagged little that the climatology test did not also flag, and raised many false flags where data drifts.
+
+The statistical range is one `[lower, upper]` pair per variable and is calculated as follows:
 
 1. **Normality check.** Skewness and excess kurtosis are computed for all remaining values together. The data counts as **normal** when both conditions hold:
    - `|skewness| < 1.0`
-   - `-2.0 < excess kurtosis < 2.0`
+   - `-1.0 < excess kurtosis < 2.0`
 
-   See [Known issues](#known-issues) about how the kurtosis value is computed.
-2. **Suspect span:**
+   Excess kurtosis comes from `dask.array.stats.kurtosis(..., fisher=True)`, so a normal distribution scores 0. The lower bound is −1 so that flat, uniform-like data (excess kurtosis −1.2, e.g. profiler pressure) is treated as non-normal; mean ± 5σ of such data reaches far outside the observed range.
+2. **Statistical range:**
 
    | Distribution | Lower | Upper | Coverage |
    |---|---|---|---|
@@ -86,45 +87,58 @@ The test produces one `[lower, upper]` pair per variable, or one per depth bin f
    | Non-normal | **0.0000287th** percentile | **99.9999713th** percentile | the same two-sided coverage as ±5σ |
 
    σ is the population standard deviation of all remaining values (xarray `std`, `ddof=0`). If σ = 0, the span collapses to the mean.
-3. **Clipping.** The span is clipped to the sensor limits.
-4. **Fail span.** The fail span is the sensor limits from `parameterMap.csv`, unchanged.
+3. **Clipping.** The range is clipped to the sensor limits.
+4. **Fail span.** The fail span is the sensor limits from `parameterMap.csv`, unchanged. This is the only span exported.
 
-The lookup file stores these as `{"qartod": {"gross_range_test": {"suspect_span": [lower, upper], "fail_span": [min, max]}}}`, with both suspect-span values rounded to 2 decimals. The `notes` column records the method, skewness, excess kurtosis, μ and σ, whether clipping happened, and whether the data was decimated.
+The lookup file stores `{"qartod": {"gross_range_test": {"fail_span": [min, max]}}}`. The `notes` column records the statistical range (rounded to 2 decimals), the method, skewness, excess kurtosis, μ and σ, whether clipping happened, and whether the data was decimated.
 
-To change the width, edit the constants at the top of `grossRange.py`. Presets for 3σ (0.135 / 99.865 percentiles) and 4σ (0.0032 / 99.9968 percentiles) are in the file, commented out.
+To change the width, edit the constants at the top of `grossRange.py`. Equivalent percentiles: 3σ is 0.135 / 99.865, 4σ is 0.0032 / 99.9968.
 
 | Constant | Current value |
 |---|---|
 | `NORMAL_STD_MULTIPLIER` | `5.0` |
 | `PERCENTILE_LOWER` / `PERCENTILE_UPPER` | `0.0000287` / `99.9999713` |
 | `SKEWNESS_THRESHOLD` | `1.0` |
-| `EXCESS_KURTOSIS_LOWER` / `EXCESS_KURTOSIS_UPPER` | `-2.0` / `2.0` |
+| `EXCESS_KURTOSIS_LOWER` / `EXCESS_KURTOSIS_UPPER` | `-1.0` / `2.0` |
 
-If no valid data remains, or the statistics come out as NaN, the suspect span falls back to the sensor limits. The `notes` column says when that happens.
+If no valid data remains, or the statistics come out as NaN, the statistical range falls back to the sensor limits. The `notes` column says when that happens.
 
 ### Climatology (`climatology.py`)
 
 The test produces 12 monthly `[lower, upper]` pairs per variable, or 12 per depth bin for profilers.
 
-1. **Monthly mean and σ.** Every data point in the record is grouped by calendar month, pooling all years (all Januaries together, and so on). For each month, the code computes the mean and the population standard deviation (`ddof=0`). A month with no data has a NaN mean.
-2. **Missing σ.** A NaN monthly σ is filled by linear interpolation from its neighbors, wrapping around the year (December connects to January). Any σ that is still NaN or ≤ 0 is replaced with the median of the valid monthly σ values. If there are none, it becomes 1% of the sensor range. The `notes` column records any replacement.
-3. **Bounds:**
+The method follows OOI's reference implementation ([ooi-data-explorations `qartod/climatology.py`](https://github.com/oceanobservatories/ooi-data-explorations/blob/master/python/ooi_data_explorations/qartod/climatology.py)), except that the same number of harmonic cycles is used for the R² and for the fitted curve.
+
+1. **Monthly series.** The full record is resampled to one mean per calendar month (`resample(time="1MS")`). Ten years of data gives about 120 values.
+2. **Harmonic fit.** A least-squares fit to that series:
 
    ```
-   lower[m] = monthly_mean[m] − 3σ[m]
-   upper[m] = monthly_mean[m] + 3σ[m]
+   y(t) = β0 + Σ_{k=1..N} [ β_sk·sin(2πkt/12) + β_ck·cos(2πkt/12) ]      t in months
    ```
 
-   The multiplier is **3 standard deviations** (`N_STD_DEVIATIONS = 3`). Both bounds are clipped to the sensor limits. A month with no data gets NaN bounds.
-4. **Harmonic fit (goes in the notes only).** The code also fits a harmonic regression to the 12 monthly means: an intercept plus annual, semi-annual, 4-month and 3-month sine/cosine pairs. The fit needs at least 4 months of data. Its R² goes in the `notes` column. If R² < 0.15, the note says "Using raw monthly means". **The fitted curve is not used for the bounds.** The bounds always come from the raw monthly means in step 3.
+   `N_HARMONICS = 4` gives annual, semi-annual, 4-month and 3-month cycles (12, 6, 4 and 3 months). The same model is used for both the R² and the fitted curve. The fit needs more monthly values than model terms (currently more than 9). Fewer cycles give a smoother curve that misses sharp seasonal features: on shallow profiler chlorophyll and oxygen, 2 cycles flagged 2–4× as much training-period data as 4 cycles.
+3. **Center curve.** The fitted series is averaged by calendar month to give 12 values.
+   - **R² ≥ 0.15:** the fitted curve is the center. Because the curve is defined for every month in the record, months with no data still get a value.
+   - **R² < 0.15, or too few monthly values to fit:** the center is the monthly means instead. These are computed with all years pooled (all Januaries together, and so on), and missing months are filled by linear interpolation that wraps December → January.
+4. **Monthly σ.** The population standard deviation (`ddof=0`) of the original data for each calendar month, with all years pooled. Missing months are filled with the same wrapping interpolation. Any σ that is still NaN or ≤ 0 is replaced with the median of the valid monthly σ values. If there are none, it becomes 1% of the sensor range. The `notes` column records any replacement.
+5. **Bounds:**
+
+   ```
+   lower[m] = center[m] − 3σ[m]
+   upper[m] = center[m] + 3σ[m]
+   ```
+
+   The multiplier is **3 standard deviations** (`N_STD_DEVIATIONS = 3`). Both bounds are clipped to the sensor limits.
+
+The `notes` column says which center was used, gives the number of cycles and the R², and records whether the data was decimated.
 
 | Constant | Current value |
 |---|---|
 | `N_STD_DEVIATIONS` | `3` |
+| `N_HARMONICS` | `4` |
 | `MIN_R2_THRESHOLD` | `0.15` |
-| `MIN_DATA_POINTS` | `4` |
 
-**Profilers.** Climatology is `binned` (set in `qartodTests.csv`), so steps 1–4 run separately for each depth bin. Bins come from `_setup_profiler_bins` in `qartod_rca.py`:
+**Profilers.** Climatology is `binned` (set in `qartodTests.csv`), so steps 1–5 run separately for each depth bin. Bins come from `_setup_profiler_bins` in `qartod_rca.py`:
 
 | Node | Bins |
 |---|---|
@@ -141,7 +155,8 @@ The test produces 12 monthly `[lower, upper]` pairs per variable, or 12 per dept
 
 ### Known issues
 
-- **Kurtosis is offset by 3.** `dask.array.stats.kurtosis` probably returns *excess* kurtosis by default (`fisher=True`, as in scipy), and `grossRange.py` subtracts 3 on top of that. If so, data from a true normal distribution scores about −3 and fails the `-2 < excess kurtosis < 2` check. Nearly every variable would then take the **percentile** path instead of mean ± 5σ. Check which one was used in the `notes` column of a lookup file.
+- **Percentile path ≈ data extremes.** The 0.0000287th and 99.9999713th percentiles only differ from the data's minimum and maximum once there are about 3.5 million points. For non-normal data the statistical range is essentially the min and max of the annotation-filtered data.
+
 ---
 
 ## Configuration files
@@ -164,8 +179,8 @@ Adding a new instrument:
 
 ## Fixed vs. profiler platforms
 
-- **Fixed:** the whole record goes into one gross range. When `-d > 0`, decimation uses LTTB (`decimate.py`).
-- **Profiler:** gross range is `integrated`, meaning one range over all depths. Climatology is `binned` by depth (bins are set in `_setup_profiler_bins` in `qartod_rca.py`). When `-d > 0`, decimation uses `xarray.coarsen`. For PAR and SPKIR, the integrated range uses only data shallower than 10 m.
+- **Fixed:** the whole record goes into one gross range.
+- **Profiler:** gross range is `integrated`, meaning one range over all depths. Climatology is `binned` by depth (bins are set in `_setup_profiler_bins` in `qartod_rca.py`). For PAR and SPKIR, the integrated range uses only data shallower than 10 m.
 
 ---
 
@@ -177,5 +192,4 @@ Adding a new instrument:
 | `qartodProcessing.py` | Argument parsing, S3/Zarr loading, annotation loading, QC and annotation filtering |
 | `grossRange.py` | Gross range calculation |
 | `climatology.py` | Monthly climatology calculation |
-| `decimate.py` | LTTB downsampling |
 | `export.py` | Writes table and lookup CSVs to `~/qartod_staging/` |

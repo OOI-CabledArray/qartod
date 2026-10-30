@@ -34,8 +34,7 @@ TEST_CLIMATOLOGY = 'climatology'
 CALC_INTEGRATED = 'int'
 CALC_BINNED = 'binned'
 
-# Decimation methods (reported in test notes)
-DEC_LTTB = 'LTTB (Largest Triangle Three Buckets) algorithm'
+# Decimation method (reported in test notes)
 DEC_COARSEN = 'xarray coarsen function'
 
 
@@ -163,9 +162,7 @@ def run_binned_processing_for_param(
             # Decimate if necessary
             if (len(data_param['time']) > dec_threshold) and (dec_threshold > 0):
                 logger.info(f"Applying decimation for parameter: {param}")
-                window = int(len(data_param['time']) / dec_threshold)
-                data_param = data_param.coarsen(time=window, boundary='trim').mean()
-                #data_param = qp.decimateData(data_param, dec_threshold)
+                data_param = qp.decimateData(data_param, dec_threshold)
                 was_decimated = True
                 final_points = len(data_param['time'])
             
@@ -226,9 +223,7 @@ def run_binned_processing_for_param(
                         # Decimate based on bin size
                         if (len(data_bin['time']) > dec_threshold) and (dec_threshold > 0):
                             logger.info(f"Applying decimation for parameter: {param}")
-                            window = int(len(data_bin['time']) / dec_threshold)
-                            data_bin = data_bin.coarsen(time=window, boundary='trim').mean()
-                            #data_bin = qp.decimateData(data_bin, dec_threshold)
+                            data_bin = qp.decimateData(data_bin, dec_threshold)
                             was_decimated = True
                             final_points = len(data_bin['time'])
                         
@@ -275,7 +270,8 @@ def _setup_profiler_bins(node: str, parameter: str = None, max_depth: float = No
     """
     if 'SF0' in node:
         # Check if parameter requires special binning
-        if parameter and ('pco2' in parameter.lower() or 'ph' in parameter.lower()):
+        # match on prefix: a bare 'ph' substring would also catch 'chlorophyll'
+        if parameter and parameter.lower().startswith(('pco2', 'ph_')):
             # Special binning: 10m intervals from 15-115, then two bins: 115-150 and 150-195
             shallow_bins = np.arange(15, 115, 10)
             deep_bins = np.array([115, 150, 195])
@@ -518,7 +514,7 @@ def runQartod_driver_main():
                         was_decimated=was_decimated,
                         original_points=original_points,
                         final_points=final_points,
-                        dec_method=DEC_LTTB
+                        dec_method=DEC_COARSEN
                     )
                 except Exception as e:
                     logger.error(f"Test failed for {param}/{test}: {e}")

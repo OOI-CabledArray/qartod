@@ -379,21 +379,21 @@ def exportTables(qartodDict, qartodTests_dict, site, node, sensor, stream, platf
             if isinstance(upper_val, (list, tuple)):
                 upper_val = float(upper_val[0]) if upper_val else 0.0
 
+            # Only the fail span (sensor limits) is exported; the statistical range is recorded in the notes
+            notes = param_dict['gross_range'][testKey].get("notes", "No notes available")
             qc_dict = {
                 "subsite": site,
                 "node": node,
                 "sensor": sensor,
                 "stream": stream,
                 "parameters": {"inp": param},
-                "gross_range_suspect": [float(f"{lower_val:.2f}"), float(f"{upper_val:.2f}")],
                 "gross_range_fail": limits,
-                "notes": param_dict['gross_range'][testKey].get("notes", "No notes available")
+                "notes": f"Statistical range (not applied): [{lower_val:.2f}, {upper_val:.2f}]. {notes}"
             }
 
             qcConfig = {
                 "qartod": {
                     "gross_range_test": {
-                        "suspect_span": qc_dict["gross_range_suspect"],
                         "fail_span": qc_dict["gross_range_fail"]
                     }
                 }

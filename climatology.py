@@ -2,15 +2,12 @@
 # -*- coding: utf-8 -*-
 
 import numpy as np
-import pandas as pd
-import dask
 from loguru import logger
-import dask.array as da
 import xarray as xr
 
 # Statistical constants
-MIN_R2_THRESHOLD = 0.15  # Minimum variance explained for harmonic fit
-MIN_DATA_POINTS = 4      # Minimum points needed for regression
+MIN_R2_THRESHOLD = 0.15  # Minimum variance explained to use the harmonic fit
+N_HARMONICS = 4          # Harmonic cycles for both the R² and the fitted curve (1=annual, 2=+semi-annual, ...)
 N_STD_DEVIATIONS = 3     # Number of standard deviations for climatology bounds
 
 
@@ -28,212 +25,76 @@ def _auto_chunk_time(da_in):
     return da_in.chunk(chunk_dict)
 
 
-def _compute_monthly_means(da):
+def _cyclic_interp(g):
     """
-    Compute monthly means grouped by calendar month (1..12).
-    Return an xarray DataArray with a 'month' dimension (1..12).
-    This is kept lazy (no .compute()) so caller can decide when to evaluate.
+    Fill NaN months (1..12) by linear interpolation that wraps December→January.
     """
-    da = _auto_chunk_time(da)
-
-    # Group by calendar month (1..12) — keeps 'month' as a dimension
-    m = da.groupby("time.month").mean(dim="time")
-
-    if "depth" in m.dims:
-        m = m.mean(dim="depth")  # lazy depth averaging
-
-    # Ensure months 1..12 exist and are in order
-    all_months = xr.DataArray(np.arange(1, 13), dims="month", name="month")
-    m = m.reindex(month=all_months)  # missing months will be NaN
-
-    return m  # xarray DataArray with 'month' dim
+    g = g.reindex(month=np.arange(1, 13)).compute()
+    if not g.isnull().any():
+        return g
+    # Pad [Nov, Dec] + Jan..Dec + [Jan, Feb] on a sequential index, interpolate, keep the middle
+    padded = xr.concat([g.isel(month=[10, 11]), g, g.isel(month=[0, 1])], dim="month")
+    padded = padded.assign_coords(month=np.arange(16)).interpolate_na(dim="month", method="linear")
+    return padded.isel(month=slice(2, 14)).assign_coords(month=np.arange(1, 13))
 
 
-def _compute_monthly_std(da):
+def _monthly_stat(da, stat):
     """
-    Fully Dask-optimized monthly std.
-    Returns an xarray DataArray indexed by 'month' (1..12), lazy.
-    
-    Handles cyclic boundary (December→January) with proper interpolation.
-    
-    Uses sequential indexing for interpolation to avoid non-monotonic error.
+    Monthly statistic ('mean' or 'std') grouped by calendar month, all years pooled,
+    with missing months filled cyclically. Returns a 12-value DataArray on 'month'.
     """
-    da = _auto_chunk_time(da)
-
-    g = da.groupby("time.month").std(dim="time")
-
+    g = getattr(_auto_chunk_time(da).groupby("time.month"), stat)(dim="time")
     if "depth" in g.dims:
-        g = g.mean(dim="depth")  # lazy depth averaging
-
-    # Ensure all months exist
-    all_months = xr.DataArray(np.arange(1, 13), dims="month", name="month")
-    g = g.reindex(month=all_months)
-
-    # Rechunk month to a single chunk for interpolation (safe)
-    g = g.chunk({"month": -1})
-
-    # Cyclic boundary handling with sequential indexing
-    # This avoids the "Index 'month' must be monotonically increasing" error
-    if g.isnull().any():
-        # Create padded array: [Nov, Dec, Jan...Dec, Jan, Feb]
-        # Using month values: [11, 12, 1, 2, 3, ..., 12, 1, 2]
-        pad_start = g.sel(month=[11, 12])
-        pad_end = g.sel(month=[1, 2])
-        padded = xr.concat([pad_start, g, pad_end], dim='month')
-        
-        # Create sequential index (0, 1, 2, ..., 15) to make it monotonically increasing
-        padded_values = padded.values
-        padded_sequential = xr.DataArray(
-            padded_values,
-            dims=['month'],
-            coords={'month': np.arange(len(padded_values))}
-        )
-        
-        # Now interpolation will work because index is sequential
-        padded_sequential = padded_sequential.interpolate_na(dim="month", method="linear", max_gap=None)
-        
-        # Extract the middle 12 months (indices 2-13)
-        g_interpolated = padded_sequential.isel(month=slice(2, 14))
-        
-        # Restore the original month coordinate (1..12)
-        g = xr.DataArray(
-            g_interpolated.values,
-            dims=['month'],
-            coords={'month': np.arange(1, 13)}
-        )
-
-    # Return xarray DataArray (still lazy)
-    return g
+        g = g.mean(dim="depth")
+    return _cyclic_interp(g)
 
 
-def _harmonic_regression(ts):
+def _harmonic_design(t, n_harmonics=N_HARMONICS):
     """
-    Perform the 4-cycle harmonic regression used by OOI QARTOD.
-    
-    The regression model includes:
-    - Constant term (mean)
-    - Annual cycle (12-month period): sin(2πft), cos(2πft)
-    - Semi-annual cycle (6-month): sin(4πft), cos(4πft)
-    - Tertiary cycle (4-month): sin(6πft), cos(6πft)
-    - Quarterly cycle (3-month): sin(8πft), cos(8πft)
-    
-    Args:
-        ts: Array of monthly values (length N, typically 12)
-    
+    Design matrix: intercept + sin/cos pairs for periods of 12/k months, k = 1..n_harmonics.
+    """
+    w = 2 * np.pi * t / 12
+    cols = [np.ones_like(w)]
+    for k in range(1, n_harmonics + 1):
+        cols += [np.sin(k * w), np.cos(k * w)]
+    return np.column_stack(cols)
+
+
+def _compute_monthly_fit(da):
+    """
+    Harmonic climatology fit, following OOI ooi-data-explorations (qartod/climatology.py),
+    but using the same N_HARMONICS for both the R² and the fitted curve.
+
+    1. Resample the full record to one mean per month (e.g. 120 values for 10 years).
+    2. Least-squares fit of the N_HARMONICS-cycle model to that series.
+    3. Average the fitted series by calendar month -> 12 values.
+
     Returns:
-        beta: Regression coefficients [9 values]
-        r2: R-squared value (variance explained)
-        N: Number of data points
+        fitted_monthly: 12-value DataArray on 'month', or None if the fit can't be made
+        r2: variance explained (None if the fit can't be made)
     """
-    f = 1 / 12  # Fundamental frequency (annual cycle)
-    N = len(ts)
-    t = np.arange(N)
+    ts = _auto_chunk_time(da).resample(time="1MS").mean()
+    if "depth" in ts.dims:
+        ts = ts.mean(dim="depth")
+    ts = ts.compute()
 
-    # Filter out NaN values
-    mask = ~np.isnan(ts)
-    ts_fit = ts[mask]
-    t_fit = t[mask]
-    n = len(ts_fit)
+    t = np.arange(ts.sizes["time"])
+    valid = ts.notnull().values
+    X = _harmonic_design(t[valid])
+    y = ts.values[valid]
 
-    if n < MIN_DATA_POINTS:
-        logger.warning(f"Insufficient data for harmonic regression: {n} points (need >={MIN_DATA_POINTS})")
-        return None, None, None
+    if len(y) <= X.shape[1]:
+        logger.warning(f"Insufficient monthly values for harmonic regression: {len(y)} (need >{X.shape[1]})")
+        return None, None
 
-    # Design matrix: intercept + 4 harmonic pairs (8 coefficients)
-    X = np.column_stack([
-        np.ones(n),                        # beta[0]: intercept
-        np.sin(2*np.pi*f*t_fit),          # beta[1]: annual sin
-        np.cos(2*np.pi*f*t_fit),          # beta[2]: annual cos
-        np.sin(4*np.pi*f*t_fit),          # beta[3]: semi-annual sin
-        np.cos(4*np.pi*f*t_fit),          # beta[4]: semi-annual cos
-        np.sin(6*np.pi*f*t_fit),          # beta[5]: tertiary sin
-        np.cos(6*np.pi*f*t_fit),          # beta[6]: tertiary cos
-        np.sin(8*np.pi*f*t_fit),          # beta[7]: quarterly sin
-        np.cos(8*np.pi*f*t_fit),          # beta[8]: quarterly cos
-    ])
+    beta, resid, rank, _ = np.linalg.lstsq(X, y, rcond=None)
+    tss = ((y - y.mean()) ** 2).sum()
+    r2 = float(1 - resid[0] / tss) if (resid.size and tss > 0) else 0.0
 
-    # Least squares regression
-    beta, resid, rank, s = np.linalg.lstsq(X, ts_fit, rcond=None)
-    
-    p = X.shape[1]  # number of predictors
-    
-    if resid.size == 0 or n <= p or rank < p or ts_fit.size == 0:
-        logger.warning(f"Failed harmonic regression: resid.size={resid.size}, n={n}, p={p}, rank={rank}, ts_fit.size={ts_fit.size}")
-        r2 = 0.0
-        
-    else:
-        rss = resid[0]
-        tss = np.sum((ts_fit - ts_fit.mean())**2)
-        if tss > 0:
-            r2 = 1.0 - (rss / tss)
-        else:
-            r2 = 0.0
+    fitted = xr.DataArray(_harmonic_design(t) @ beta, dims="time", coords={"time": ts.time})
+    fitted_monthly = fitted.groupby("time.month").mean().reindex(month=np.arange(1, 13))
 
-    return beta, r2, N
-
-
-def _compute_monthly_fit(monthly_means):
-    """
-    Compute the monthly fitted climatology curve from monthly means.
-    
-    Uses harmonic regression with 4 cycles. If regression fails (R² < 0.15)
-    or cannot be computed, falls back to raw monthly means.
-    
-    Uses all computed harmonic coefficients (not just first 5).
-
-    Args:
-        monthly_means: pandas Series or xarray DataArray with 12 monthly values
-    
-    Returns:
-        fitted_monthly: pandas Series with fitted values indexed 1..12
-        r2: R-squared value (or None if fallback used)
-    """
-    # Accept either pandas Series or xarray DataArray
-    if isinstance(monthly_means, xr.DataArray):
-        # convert to pandas Series with month index 1..12
-        monthly_means = pd.Series(monthly_means.values.flatten(), index=np.arange(1, 13))
-
-    ts = monthly_means.values
-    beta, r2, N = _harmonic_regression(ts)
-
-    if beta is None or r2 is None or r2 < MIN_R2_THRESHOLD:
-        # Fallback to raw monthly means (ensure index 1..12)
-        if r2 is None:
-            r2_str = "N/A"
-        else:
-            r2_str = f"{r2:.3f}"
-            
-        logger.info(
-        f"Using raw monthly means (R²={r2_str} < {MIN_R2_THRESHOLD})"
-        )
-        
-        ##logger.info(f"Using raw monthly means (R²={r2:.3f if r2 else 'N/A'} < {MIN_R2_THRESHOLD})")
-        return monthly_means.groupby(monthly_means.index).mean().reindex(np.arange(1, 13)), r2
-
-    # Use ALL harmonic coefficients for better fit
-    # Construct fitted monthly climatology
-    f = 1 / 12
-    t = np.arange(N)
-
-    fitted = (
-        beta[0]                              # Intercept
-        + beta[1]*np.sin(2*np.pi*f*t)       # Annual cycle
-        + beta[2]*np.cos(2*np.pi*f*t)
-        + beta[3]*np.sin(4*np.pi*f*t)       # Semi-annual cycle
-        + beta[4]*np.cos(4*np.pi*f*t)
-        + beta[5]*np.sin(6*np.pi*f*t)       # Tertiary cycle (4-month)
-        + beta[6]*np.cos(6*np.pi*f*t)
-        + beta[7]*np.sin(8*np.pi*f*t)       # Quarterly cycle (3-month)
-        + beta[8]*np.cos(8*np.pi*f*t)
-    )
-
-    # Convert to monthly climatology by averaging fitted values by calendar month
-    idx = monthly_means.index
-    fitted_monthly = pd.Series(fitted[:len(idx)], index=idx).groupby(idx).mean()
-    fitted_monthly = fitted_monthly.reindex(np.arange(1, 13))
-    
-    logger.debug(f"Harmonic regression successful (R²={r2:.3f})")
-    
+    logger.debug(f"Harmonic regression ({N_HARMONICS} cycles): R²={r2:.3f}, {len(y)} monthly values")
     return fitted_monthly, r2
 
 
@@ -285,38 +146,21 @@ def process_climatology(ds, param, sensor_range, **kwargs):
             "notes": "No valid data after filtering"
         }
     
-    # Compute monthly statistics
-    monthly_mean = _compute_monthly_means(da)
-    monthly_std  = _compute_monthly_std(da)
-    
-    # Compute harmonic fit + R²
-    fitted_monthly, r2 = _compute_monthly_fit(monthly_mean)
-
-    # Construct note based on R²
-    if r2 is None or r2 < MIN_R2_THRESHOLD:
-        note = f"Using raw monthly means (low variance explained: R²={0.0 if r2 is None else r2:.3f})"
+    # Center: harmonic fit if it explains enough variance, otherwise monthly means
+    fitted_monthly, r2 = _compute_monthly_fit(da)
+    if r2 is not None and r2 >= MIN_R2_THRESHOLD:
+        center = _cyclic_interp(fitted_monthly)
+        note = (f"Climatology based on a {N_HARMONICS}-cycle harmonic fit to the monthly means "
+                f"± {N_STD_DEVIATIONS}x the monthly standard deviations. "
+                f"Variance explained: R²={r2:.3f}.")
     else:
-        note = f"Harmonic regression variance explained: R²={r2:.3f}"
+        center = _monthly_stat(da, "mean")
+        note = (f"Climatology based on the monthly means ± {N_STD_DEVIATIONS}x the monthly standard deviations "
+                f"(harmonic fit not used: R²={'N/A' if r2 is None else f'{r2:.3f}'} < {MIN_R2_THRESHOLD}).")
 
-    # Compute numeric monthly mean/std (small arrays)
-    mm = monthly_mean.compute().values
-    ms = monthly_std.compute().values
-    
-    # handling of incorrect array sizes
-    if len(mm) != 12:
-        logger.error(f"[CLIM] Monthly mean has {len(mm)} values instead of 12")
-        # Pad with NaN instead of using np.resize (which cycles values)
-        mm_padded = np.full(12, np.nan)
-        mm_padded[:len(mm)] = mm
-        mm = mm_padded
+    mm = center.values
+    ms = _monthly_stat(da, "std").values
 
-    if len(ms) != 12:
-        logger.error(f"[CLIM] Monthly std has {len(ms)} values instead of 12")
-        # Pad with NaN instead of using np.resize
-        ms_padded = np.full(12, np.nan)
-        ms_padded[:len(ms)] = ms
-        ms = ms_padded
-    
     # Check for any NaN or zero std (would cause invalid bounds)
     if np.any(np.isnan(ms)) or np.any(ms <= 0):
         logger.warning(f"[CLIM] Some months have NaN or zero standard deviation")

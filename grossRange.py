@@ -5,12 +5,11 @@
 Gross Range Test Implementation for QARTOD
 
 This module calculates user-defined sensor ranges using statistical analysis.
-For normally distributed data, uses mean ± 3σ. For non-normal data, uses
+For normally distributed data, uses mean ± NORMAL_STD_MULTIPLIER σ (5σ). For non-normal data, uses
 percentile-based ranges.
 """
 
 import numpy as np
-import pandas as pd
 import dask.array as da_np
 from dask.array import stats as da_stats
 from dask.diagnostics import ProgressBar
@@ -19,14 +18,8 @@ from typing import Dict, List, Union
 
 # Statistical constants
 SKEWNESS_THRESHOLD = 1.0           # Absolute skewness threshold for normality
-EXCESS_KURTOSIS_LOWER = -2.0       # Lower bound for excess kurtosis
+EXCESS_KURTOSIS_LOWER = -1.0       # Lower bound for excess kurtosis (uniform-like data, e.g. profiler pressure, is -1.2)
 EXCESS_KURTOSIS_UPPER = 2.0        # Upper bound for excess kurtosis
-#NORMAL_STD_MULTIPLIER = 3.0       # Number of std deviations for normal distribution
-#PERCENTILE_LOWER = 0.135           # Lower percentile for non-normal (99.73% coverage)
-#PERCENTILE_UPPER = 99.865          # Upper percentile for non-normal
-#NORMAL_STD_MULTIPLIER = 4.0        # Number of std deviations for normal distribution (99.9937% coverage)
-#PERCENTILE_LOWER = 0.0032          # Lower percentile for non-normal 
-#PERCENTILE_UPPER = 99.9968         # Upper percentile for non-normal
 NORMAL_STD_MULTIPLIER = 5.0        # Number of std deviations for normal distribution (99.999943% coverage)
 PERCENTILE_LOWER = 0.0000287      # Lower percentile for non-normal 
 PERCENTILE_UPPER = 99.9999713     # Upper percentile for non-normal
@@ -78,15 +71,13 @@ def _check_normality(darr):
     with ProgressBar():
         # Dask stats functions don't support nan_policy, so we work with clean data
         skew = da_stats.skew(darr_clean).compute()
-        kurt = da_stats.kurtosis(darr_clean).compute()
+        # fisher=True returns excess kurtosis (normal distribution = 0)
+        excess_kurt = da_stats.kurtosis(darr_clean, fisher=True).compute()
     
     # Ensure we have scalar values, not NaN
-    if np.isnan(skew) or np.isnan(kurt):
+    if np.isnan(skew) or np.isnan(excess_kurt):
         logger.warning("NaN detected in skewness or kurtosis - assuming non-normal")
         return False, skew, np.nan
-    
-    # Convert to excess kurtosis (normal distribution has excess kurtosis = 0)
-    excess_kurt = kurt - 3.0
     
     # Check both skewness and excess kurtosis
     is_normal = (
@@ -120,7 +111,6 @@ def _compute_percentile_range(darr):
         upper = da_np.nanpercentile(darr_flat, PERCENTILE_UPPER, axis=0).compute()
     
     # Ensure values are scalars and not NaN
-    print(lower, upper)
     lower = float(lower)
     upper = float(upper)
     
@@ -133,7 +123,7 @@ def _compute_percentile_range(darr):
 
 def _compute_normal_range(da):
     """
-    Compute range using mean ± 3σ for normal data.
+    Compute range using mean ± NORMAL_STD_MULTIPLIER σ for normal data.
     
     Args:
         da: xarray DataArray (may contain NaNs)
@@ -141,7 +131,7 @@ def _compute_normal_range(da):
     Returns:
         tuple: (lower, upper, mean, std)
     """
-    logger.info("Using mean ± 3σ range (normal distribution)")
+    logger.info(f"Using mean ± {NORMAL_STD_MULTIPLIER}σ range (normal distribution)")
     
     with ProgressBar():
         # xarray's mean and std handle NaNs by default with skipna=True
@@ -178,10 +168,8 @@ def process_gross_range(
     Memory-safe gross range calculation using Dask-backed xarray.
     
     Calculates user-defined quality control ranges based on statistical analysis:
-    - For normally distributed data: mean ± 3 standard deviations
-    - For non-normal data: 0.15th to 99.85th percentiles (99.87% coverage)
-    - TESTING with mean ± 4 standard deviations and 99.997th percentile range for non-normal data
-    - (which translates to 0.0015th to 99.9985th percentiles for non-normal data)
+    - Normal (|skew| < 1 and -1 < excess kurtosis < 2): mean ± 5 standard deviations
+    - Non-normal: 0.0000287th to 99.9999713th percentiles (same two-sided coverage as ±5σ)
     
     The calculated ranges are constrained to stay within vendor sensor limits.
     
@@ -258,7 +246,7 @@ def process_gross_range(
             lower, upper = _compute_percentile_range(darr)
             notes = (
                 f"Non-normal distribution (skew={skew:.3f}, excess_kurt={excess_kurt:.3f}): "
-                f"using {PERCENTILE_LOWER}th and {PERCENTILE_UPPER}th percentiles "
+                f"using {PERCENTILE_LOWER:.7f}th and {PERCENTILE_UPPER:.7f}th percentiles "
                 f"(approx. {NORMAL_STD_MULTIPLIER} std devs)."
             )
         else:
